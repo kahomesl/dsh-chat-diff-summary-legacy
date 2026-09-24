@@ -7,8 +7,8 @@ A Codex-style per-turn change summary bar above the composer, built for the
 [ 1 个文件已更改                            +542   -20 ]
 ```
 
-- **Designed and tested specifically for DSH Desktop 2.0.13 / DSH 0.1.5-rc.2.**
-  It does not use, and does not need, anything introduced in 0.1.6 or later.
+- **Kernel range: `>=0.1.5-rc.1 <0.1.6`**, verified on `0.1.5-rc.2` — the kernel
+  DSH Desktop 2.0.13 ships. See [Compatibility](#compatibility).
 - Changed-file count in ordinary text; `+added` in the success token and
   `-deleted` in the error token; one 38px row, 14px radius, 1px border, no heavy
   shadow, no gradient, no glass effect.
@@ -161,6 +161,40 @@ same-length edits — a turn whose change went unreported. `git read-tree HEAD`
 populates entries with no stat data, so `git add` must hash every path; the same
 probe scored **0 of 40**. `tests/git.spec.ts` keeps that probe as a regression
 guard.
+
+## Compatibility
+
+| | |
+|---|---|
+| **Declared** | `>=0.1.5-rc.1 <0.1.6` — `dsh.engines.dsh` in `package.json` |
+| **Verified** | `0.1.5-rc.2`, the kernel shipped by DSH Desktop 2.0.13 |
+| **Untested** | `0.1.5-rc.1` and other 0.1.5-line patches |
+| **Out of scope** | `0.1.6` and later |
+
+**The Desktop version and the kernel version are two different numbers.** DSH
+Desktop is on `2.0.x`; the DeepSeek Harness kernel is on `0.1.x`. This plugin has
+been exercised against exactly one pairing: **DSH Desktop 2.0.13 + kernel
+0.1.5-rc.2**.
+
+To read the kernel version you actually have:
+
+```bash
+# @deepseek-ai/dsh-base carries the kernel version
+node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/dsh-base/package.json').version"
+# → 0.1.5-rc.2
+```
+
+**Why the upper bound is `0.1.6`.** Every host surface this plugin touches exists
+in the 0.1.5 line: the `conversation.input.dock` slot, route registration through
+`ctx.connection.fetch`, and the `session/event` and `tools/pre-execute` events.
+`0.1.6-alpha.2` and `0.1.7-rc.1` do exist, but this plugin uses nothing they
+introduced and has never been run against them, so the range stops at `<0.1.6`.
+
+**The field is a declaration, not a gate.** `dsh.engines.dsh` is the same field
+`@linxin666/*` and other third-party plugins use (inside the `dsh` object,
+alongside `bundle` and `client`); the current DSH loading path does not read it,
+so it cannot block a load. It states the range the author supports and has
+tested — it is not a runtime version check.
 
 ## What is deliberately not implemented
 

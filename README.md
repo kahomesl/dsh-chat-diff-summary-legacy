@@ -8,7 +8,9 @@
 
 ![收起态](docs/preview/01-collapsed-dark.png)
 
-专为 **DSH Desktop 2.0.13 / DeepSeek Harness 0.1.5-rc.2** 这条 legacy 线编写：不使用、也不需要 0.1.6 及之后引入的任何东西。
+**适用内核：`>=0.1.5-rc.1 <0.1.6`** · 实测 `0.1.5-rc.2`（DSH Desktop 2.0.13）
+
+专为 **DSH Desktop 2.0.13 / DeepSeek Harness 0.1.5-rc.2** 这条 legacy 线编写：不使用、也不需要 0.1.6 及之后引入的任何东西。版本对应关系、自查方法与上界理由见[兼容的 DSH 内核版本](#兼容的-dsh-内核版本)。
 
 ---
 
@@ -118,9 +120,30 @@ dsh plugin --profile <profile> add "file:$PWD/release/<name>-<version>.tgz"
 
 两种方式都需要 **宿主进程**重新加载才生效，所以装完请重启 DSH Desktop。只重载页面只能带回浏览器半边，node 半边不行。
 
-## 兼容性与边界
+## 兼容的 DSH 内核版本
 
-**为什么叫 legacy**：仓库同时存在 0.1.6+ / 0.1.7+ 的 API，本插件刻意只使用 0.1.5-rc.2 就有的接口，`package.json` 里声明 `dsh.engines.dsh = ">=0.1.5-rc.1 <0.1.6"`，方便仍在 2.0.13 上的用户直接用。两边任何一边的 `@deepseek-ai/*` 包都不在运行时被 import —— 插件消费的每个宿主服务都在 `src/host.ts` 和 `src/client/contract.ts` 里做了结构化声明，旁边逐条引用了 0.1.5-rc.2 里的调用点。
+| | |
+|---|---|
+| **声明支持** | `>=0.1.5-rc.1 <0.1.6` —— `package.json` 里的 `dsh.engines.dsh` |
+| **实测通过** | `0.1.5-rc.2`，即 DSH Desktop 2.0.13 搭载的内核 |
+| **未实测** | `0.1.5-rc.1`，以及 0.1.5 线的其它补丁版 |
+| **不在支持范围** | `0.1.6` 及之后 |
+
+**桌面版号 ≠ 内核版号，别混。** DSH Desktop 走的是 `2.0.x`，DeepSeek Harness 内核走的是 `0.1.x`。本插件只在一个组合上实际验证过：**DSH Desktop 2.0.13 + 内核 0.1.5-rc.2**。
+
+查自己装的是哪个内核版本：
+
+```bash
+# @deepseek-ai/dsh-base 的版本就是内核版本
+node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/dsh-base/package.json').version"
+# → 0.1.5-rc.2
+```
+
+**上界为什么卡在 `0.1.6`**：本插件用到的宿主接口全部是 0.1.5 线就有的 —— `conversation.input.dock` 槽位、`ctx.connection.fetch` 路由注册、`session/event` 与 `tools/pre-execute` 事件。`0.1.6-alpha.2`、`0.1.7-rc.1` 这些版本确实存在，但它们引入的接口本插件一个都没用，也没有在上面测过，所以上界就是 `<0.1.6`。
+
+**这个字段是声明，不是闸门。** `dsh.engines.dsh` 和 `@linxin666/*` 等第三方插件用的是同一个字段（都在 `dsh` 对象里，与 `bundle`、`client` 并列）；当前 DSH 的加载路径并不读取它，所以它挡不住加载 —— 它表达的是"作者支持并实测过的范围"，而不是运行时的版本校验。
+
+**为什么叫 legacy**：0.1.6+ / 0.1.7+ 的接口已经存在，本插件刻意只使用 0.1.5-rc.2 就有的那一套，方便仍在 2.0.13 上的用户直接用。node 半边与浏览器半边在运行时都不 import 任何 `@deepseek-ai/*` 包 —— 插件消费的每个宿主服务都在 `src/host.ts` 和 `src/client/contract.ts` 里做了结构化声明，旁边逐条引用了 0.1.5-rc.2 里的调用点。
 
 **刻意没做的**：
 
