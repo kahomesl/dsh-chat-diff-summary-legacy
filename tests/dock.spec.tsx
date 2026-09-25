@@ -2,8 +2,8 @@
  * The bar itself: what it draws, what it refuses to draw, and the colour and
  * geometry contract `/styles.ts` promises.
  */
-import { describe, expect, test } from 'vitest'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { describe, expect, test, vi } from 'vitest'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import { ChatDiffSummary } from '../src/client/ChatDiffSummary.tsx'
 import { en } from '../src/client/locales.ts'
 import { STYLES } from '../src/client/styles.ts'
@@ -130,6 +130,69 @@ describe('expanding the file list', () => {
     expect(bar).toHaveAttribute('aria-expanded', 'false')
     fireEvent.click(bar)
     expect(bar).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  test('previews on hover and closes after leaving the button and list', () => {
+    vi.useFakeTimers()
+    try {
+      renderBar(summary())
+      const bar = screen.getByRole('button')
+      fireEvent.mouseEnter(bar)
+      expect(bar).toHaveAttribute('aria-expanded', 'true')
+      expect(screen.getByRole('list')).toBeInTheDocument()
+      fireEvent.mouseLeave(bar)
+      act(() => { vi.runAllTimers() })
+      expect(bar).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.queryByRole('list')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('keeps the hover preview open across the gap into the file list', () => {
+    vi.useFakeTimers()
+    try {
+      renderBar(summary())
+      const bar = screen.getByRole('button')
+      fireEvent.mouseEnter(bar)
+      const list = screen.getByRole('list')
+      fireEvent.mouseLeave(bar)
+      fireEvent.mouseEnter(list)
+      act(() => { vi.runAllTimers() })
+      expect(list).toBeInTheDocument()
+      expect(screen.getByRole('button')).toHaveAttribute('aria-expanded', 'true')
+      fireEvent.mouseLeave(list)
+      act(() => { vi.runAllTimers() })
+      expect(screen.queryByRole('list')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('click locks a hover preview until the next click, including after leaving', () => {
+    vi.useFakeTimers()
+    try {
+      renderBar(summary())
+      const bar = screen.getByRole('button')
+      fireEvent.mouseEnter(bar)
+      fireEvent.click(bar)
+      fireEvent.mouseLeave(bar)
+      act(() => { vi.runAllTimers() })
+      expect(bar).toHaveAttribute('aria-expanded', 'true')
+      fireEvent.click(bar)
+      expect(bar).toHaveAttribute('aria-expanded', 'false')
+      expect(screen.queryByRole('list')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('does not carry a locked expansion into the next turn', () => {
+    const first = summary({ turn: 4 })
+    const { rerender } = render(<ChatDiffSummary useSummary={selectorFor({ summary: first })} t={t} />)
+    fireEvent.click(screen.getByRole('button'))
+    rerender(<ChatDiffSummary useSummary={selectorFor({ summary: summary({ turn: 5 }) })} t={t} />)
+    expect(screen.getByRole('button')).toHaveAttribute('aria-expanded', 'false')
   })
 
   test('lists each changed file with its own counts', () => {

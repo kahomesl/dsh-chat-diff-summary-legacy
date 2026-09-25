@@ -11,7 +11,7 @@
  * the git working-tree snapshot, and this component only asks for the summary it
  * recorded for one Session.
  */
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { formatCount, hasChanges } from '../summary.ts'
 import type { ChangeSnapshot } from './summary-source.ts'
 import { NS } from './locales.ts'
@@ -51,15 +51,32 @@ export function ChatDiffSummary({ useSummary, t }: ChatDiffSummaryProps) {
   // The selector returns the summary object itself, whose identity the source
   // keeps stable until a turn's numbers actually change.
   const summary = useSummary((state) => state.summary)
-  const [expanded, setExpanded] = useState(false)
+  const [pinned, setPinned] = useState(false)
+  const [preview, setPreview] = useState(false)
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const expanded = pinned || preview
   const listId = useId()
+
+  function startPreview() {
+    clearTimeout(closeTimer.current)
+    setPreview(true)
+  }
+
+  function endPreview() {
+    clearTimeout(closeTimer.current)
+    // The floating list sits 2px above the button. Give the pointer time to
+    // cross that gap before hiding the list it is moving into.
+    closeTimer.current = setTimeout(() => setPreview(false), 150)
+  }
 
   // A new turn's summary starts collapsed. Keyed on the turn rather than on the
   // summary object, because an open turn is re-measured while it runs and a
   // re-read of the same turn must not fold the list the user just opened.
   const turn = summary?.turn
   useEffect(() => {
-    setExpanded(false)
+    setPinned(false)
+    setPreview(false)
+    return () => clearTimeout(closeTimer.current)
   }, [turn])
 
   if (!hasChanges(summary)) return null
@@ -79,8 +96,11 @@ export function ChatDiffSummary({ useSummary, t }: ChatDiffSummaryProps) {
         aria-controls={listId}
         aria-label={`${changed}. ${added}, ${deleted}. ${t('summary.expand')}`}
         title={t('summary.expand')}
+        onMouseEnter={startPreview}
+        onMouseLeave={endPreview}
         onClick={() => {
-          setExpanded((open) => !open)
+          setPinned((open) => !open)
+          setPreview(false)
         }}
       >
         <span className="cdsl-label">{changed}</span>
@@ -90,7 +110,8 @@ export function ChatDiffSummary({ useSummary, t }: ChatDiffSummaryProps) {
         </span>
       </button>
       {expanded && (
-        <ul className="cdsl-list" id={listId} aria-label={t('summary.files')}>
+        <ul className="cdsl-list" id={listId} aria-label={t('summary.files')}
+          onMouseEnter={startPreview} onMouseLeave={endPreview}>
           {summary.files.map((file) => (
             <li className="cdsl-row" key={file.path} title={file.path}>
               <span className="cdsl-path">{file.display}</span>
