@@ -299,6 +299,15 @@ browser half in `exports["./client"]` discovered through the `dsh.client`
 declaration, and a `cordis.patch.yml` that inserts this plugin's row and disables
 nothing).
 
+**The install path is only where the plugin's source lives.** The plugin registers
+on the whole DSH profile that installed it and applies to every Session in that
+profile, whatever disk or directory the project sits on — a `link:` specifier
+points at source, it does not narrow the plugin's workspace. Which working tree
+gets measured is decided per Session, from that Session's own
+`session.header.cwd`. There is no fixed path, allowlist or project-root filter
+anywhere in this plugin; `process.cwd()` appears only as the working directory of
+the `git --version` and `xcode-select -p` probes, never as a measurement scope.
+
 **Live link** — the profile follows this working tree, so an edit plus
 `npm run build` is enough:
 

@@ -9,6 +9,7 @@
  */
 import { describe, expect, test } from 'vitest'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { GitDiagnostics, GitFailure, GitWorkspace, ScratchMarker } from '../src/git.ts'
 import type { WorkspaceEngine } from '../src/synthetic-workspace.ts'
 import { SyntheticWorkspaces, WARMUP_BACKOFF_BASE_MS, WARMUP_BACKOFF_MAX_MS, workspaceKey } from '../src/synthetic-workspace.ts'
@@ -171,6 +172,36 @@ describe('one workspace per directory', () => {
       expect(engine.passes).toBe(1)
     } finally {
       await cleanup(dir)
+    }
+  })
+
+  test('keys two unrelated absolute workspaces apart, and neither is the plugin s own directory', async () => {
+    const engine = new FakeWorkspaces()
+    const { registry } = registryWith(engine)
+    // Two absolute paths that share nothing but the platform: one under the
+    // system temporary root, one beside it. Neither is the plugin's source
+    // directory, which is the point: the plugin is installed once for a profile
+    // and measures whatever directory each Session reports.
+    const first = await makeDir('dsh-scope-a')
+    const second = await makeDir('dsh-scope-b')
+    const source = fileURLToPath(new URL('..', import.meta.url))
+    try {
+      const preparedA = await registry.prepare('a', first, engine, never, 5_000)
+      const preparedB = await registry.prepare('b', second, engine, never, 5_000)
+      expect(preparedA.entry).not.toBe(preparedB.entry)
+      expect(preparedA.entry?.key).toBe(await workspaceKey(first))
+      expect(preparedB.entry?.key).toBe(await workspaceKey(second))
+      expect(preparedA.entry?.key).not.toBe(preparedB.entry?.key)
+      // Neither workspace is the directory the plugin is installed from.
+      for (const entry of [preparedA.entry, preparedB.entry]) {
+        expect(entry?.root.toLowerCase()).not.toBe(source.toLowerCase())
+        expect(entry?.root.toLowerCase().startsWith(source.toLowerCase())).toBe(false)
+      }
+      // Two directories, two first passes, two object stores — and one plugin.
+      expect(engine.passes).toBe(2)
+      expect(engine.scratches).toHaveLength(2)
+    } finally {
+      await cleanup(first, second)
     }
   })
 })

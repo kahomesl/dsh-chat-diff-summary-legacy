@@ -252,6 +252,44 @@ describe('a real turn in a real repository', () => {
     }
   })
 
+  test('tracks two unrelated workspaces through one plugin instance', async () => {
+    // Two absolute directories that share nothing: this plugin is installed once
+    // for a profile, so what it measures is whatever directory each Session
+    // reports, never where the plugin was installed from.
+    const first = await makeDir('dsh-scope-one')
+    const second = await makeDir('dsh-scope-two')
+    await write(first, 'kept.txt', 'one\n')
+    await write(second, 'kept.txt', 'one\n')
+    const baseline = await scratchDirs()
+    const harness = new HostHarness()
+    apply(harness.ctx)
+    try {
+      harness.emitSessionEvent(session('a', { cwd: first }), turnStart(1))
+      await harness.runGate('a', 'a-open')
+      await write(first, 'only-a.txt', 'a\n')
+      harness.emitSessionEvent(session('a', { cwd: first }), turnEnd(1))
+      await harness.runGate('a', 'a-close')
+
+      harness.emitSessionEvent(session('b', { cwd: second }), turnStart(1))
+      await harness.runGate('b', 'b-open')
+      await write(second, 'only-b.txt', 'b\n')
+      harness.emitSessionEvent(session('b', { cwd: second }), turnEnd(1))
+      await harness.runGate('b', 'b-close')
+
+      const summaryA = (await (await readSummary(harness, 'a', 1)).json()) as ChangeSummary
+      const summaryB = (await (await readSummary(harness, 'b', 1)).json()) as ChangeSummary
+      // Each workspace reports its own file, and nothing from the other one.
+      expect(summaryA.files.map((file) => file.path)).toEqual(['only-a.txt'])
+      expect(summaryB.files.map((file) => file.path)).toEqual(['only-b.txt'])
+      // One plugin instance, one workspace per directory.
+      expect((await scratchDirs()).filter((name) => !baseline.includes(name))).toHaveLength(2)
+      expect(harness.warnings).toEqual([])
+    } finally {
+      harness.dispose()
+      await cleanup(first, second)
+    }
+  })
+
   test('measures later turns of a warmed directory without another pass', async () => {
     const plain = await makeDir('dsh-warm-fast')
     await write(plain, 'kept.txt', 'one\n')

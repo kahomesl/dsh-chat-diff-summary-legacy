@@ -11,7 +11,14 @@
 #
 # This plugin owns its own legacy tracker and disables nothing: no shipped row is
 # overridden, moved or switched off. It is additive on DSH Desktop 2.0.13 /
-# DeepSeek Harness 0.1.5-rc.2, where no official change summary exists.
+# DeepSeek Harness 0.1.5-rc.1 through 0.1.7-rc.2, where no official change summary
+# exists.
+#
+# The row carries an id and a package name and nothing else: no `cwd`, no
+# workspace path, no config. A row like this registers on the whole profile, so
+# every Session in it is tracked, and the working tree each Session measures comes
+# from that Session's own `session.header.cwd` — never from where this package was
+# installed from.
 - insert:
     - id: chat-diff-summary-legacy
       name: 'dsh-chat-diff-summary-legacy'

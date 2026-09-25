@@ -145,6 +145,10 @@ node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/ds
 
 **为什么叫 legacy**：0.1.6+ / 0.1.7+ 的接口已经存在，本插件刻意只使用 0.1.5-rc.2 就有的那一套，方便仍在 2.0.13 上的用户直接用。node 半边与浏览器半边在运行时都不 import 任何 `@deepseek-ai/*` 包 —— 插件消费的每个宿主服务都在 `src/host.ts` 和 `src/client/contract.ts` 里做了结构化声明，旁边逐条引用了 0.1.5-rc.2 里的调用点。
 
+**安装路径与生效范围无关（重要）**：link 安装路径只是插件源码位置；插件对安装它的整个 DSH profile 生效，与项目位于哪个磁盘或目录无关。
+
+也就是说：`link:D:/AI/dsh-chat-diff-summary-legacy` 里的 `D:\AI` **只是插件源码所在目录**，不是工作区范围。插件注册在该 profile 上（profile 级、全局），对该 profile 下的**每个 Session** 都生效；被统计的工作区永远由该 Session 自己的 `session.header.cwd` 动态决定（`C:\`、`D:\`、`E:\`，仓库内或非仓库目录都一样）。源码里没有按固定路径、白名单或项目根过滤的逻辑；`process.cwd()` 只在探测 `git --version` / `xcode-select -p` 时用作子进程的工作目录，与统计范围无关。
+
 **刻意没做的**：
 
 - **diff 审阅**。0.1.5-rc.2 没有 `changes-review` 能力，所以点开统计条只是展开/收起一份紧凑的文件清单，文件名是纯文本而不是链接。

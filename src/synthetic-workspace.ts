@@ -193,7 +193,9 @@ export class SyntheticWorkspaces {
     if (entry === undefined) {
       let scratch: string
       try {
-        scratch = await engine.createScratch('synthetic', key)
+        // The marker records the canonical spelling, so a reader can see which
+        // directory this workspace measures; the map key stays case-folded.
+        scratch = await engine.createScratch('synthetic', canonical)
       } catch (error) {
         this.diagnostics.failed({ operation: 'create scratch directory', root: key, elapsedMs: 0, sessionId, detail: error instanceof Error ? error.message : String(error) })
         return { entry: undefined, workspace: null, ready: false }
