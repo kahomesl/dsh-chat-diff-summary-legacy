@@ -8,9 +8,9 @@
 
 ![收起态](docs/preview/01-collapsed-dark.png)
 
-**适用内核：`>=0.1.5-rc.1 <0.1.6`** · 实测 `0.1.5-rc.2`（DSH Desktop 2.0.13）
+**适用内核：`>=0.1.5-rc.1 <0.1.8`** · 实测 `0.1.5-rc.2`（DSH Desktop 2.0.13）与 `0.1.7-rc.2`（当前桌面版内核）
 
-专为 **DSH Desktop 2.0.13 / DeepSeek Harness 0.1.5-rc.2** 这条 legacy 线编写：不使用、也不需要 0.1.6 及之后引入的任何东西。版本对应关系、自查方法与上界理由见[兼容的 DSH 内核版本](#兼容的-dsh-内核版本)。
+起点是 **DSH Desktop 2.0.13 / DeepSeek Harness 0.1.5-rc.2** 这条 legacy 线：不使用、也不需要 0.1.6 及之后引入的任何东西，所以 0.1.5 与 0.1.7 两条线共用同一份构建。版本对应关系、自查方法与上界理由见[兼容的 DSH 内核版本](#兼容的-dsh-内核版本)。
 
 ---
 
@@ -124,12 +124,12 @@ dsh plugin --profile <profile> add "file:$PWD/release/<name>-<version>.tgz"
 
 | | |
 |---|---|
-| **声明支持** | `>=0.1.5-rc.1 <0.1.6` —— `package.json` 里的 `dsh.engines.dsh` |
-| **实测通过** | `0.1.5-rc.2`，即 DSH Desktop 2.0.13 搭载的内核 |
-| **未实测** | `0.1.5-rc.1`，以及 0.1.5 线的其它补丁版 |
-| **不在支持范围** | `0.1.6` 及之后 |
+| **声明支持** | `>=0.1.5-rc.1 <0.1.8` —— `package.json` 里的 `dsh.engines.dsh` |
+| **实测通过** | `0.1.5-rc.2`（DSH Desktop 2.0.13 搭载的内核）与 `0.1.7-rc.2`（当前桌面版内核） |
+| **未实测** | `0.1.5-rc.1`、`0.1.6` 线，以及两条线里的其它补丁版 |
+| **不在支持范围** | `0.1.8` 及之后 |
 
-**桌面版号 ≠ 内核版号，别混。** DSH Desktop 走的是 `2.0.x`，DeepSeek Harness 内核走的是 `0.1.x`。本插件只在一个组合上实际验证过：**DSH Desktop 2.0.13 + 内核 0.1.5-rc.2**。
+**桌面版号 ≠ 内核版号，别混。** DSH Desktop 走的是 `2.0.x`，DeepSeek Harness 内核走的是 `0.1.x`。本插件实际验证过两个组合：**DSH Desktop 2.0.13 + 内核 0.1.5-rc.2**，以及**当前桌面版 + 内核 0.1.7-rc.2**。
 
 查自己装的是哪个内核版本：
 
@@ -139,7 +139,7 @@ node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/ds
 # → 0.1.5-rc.2
 ```
 
-**上界为什么卡在 `0.1.6`**：本插件用到的宿主接口全部是 0.1.5 线就有的 —— `conversation.input.dock` 槽位、`ctx.connection.fetch` 路由注册、`session/event` 与 `tools/pre-execute` 事件。`0.1.6-alpha.2`、`0.1.7-rc.1` 这些版本确实存在，但它们引入的接口本插件一个都没用，也没有在上面测过，所以上界就是 `<0.1.6`。
+**上界为什么是 `0.1.8`**：本插件用到的宿主接口全部是 0.1.5 线就有的 —— `conversation.input.dock` 槽位、`ctx.connection.fetch` 路由注册、`session/event` 与 `tools/pre-execute` 事件。这些接口在 `0.1.7-rc.2` 上逐一核对仍然存在（`ctx.sessions.binding(id)` 返回的仍是 `{ sessionId, session, eventSource, ctx }`），所以上界抬到覆盖当前桌面版内核为止；`0.1.6` 线没有实测过，`0.1.8` 及之后不在声明范围内。
 
 **这个字段是声明，不是闸门。** `dsh.engines.dsh` 和 `@linxin666/*` 等第三方插件用的是同一个字段（都在 `dsh` 对象里，与 `bundle`、`client` 并列）；当前 DSH 的加载路径并不读取它，所以它挡不住加载 —— 它表达的是"作者支持并实测过的范围"，而不是运行时的版本校验。
 
@@ -147,7 +147,6 @@ node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/ds
 
 **刻意没做的**：
 
-- **非 Git 工作区**。legacy 2.0.13 这条线只支持 Git 工作区；不在仓库里就不显示统计，插件也绝不会去遍历目录哈希文件。
 - **diff 审阅**。0.1.5-rc.2 没有 `changes-review` 能力，所以点开统计条只是展开/收起一份紧凑的文件清单，文件名是纯文本而不是链接。
 - **持久化**。统计活在宿主进程内存里，重启宿主就没了，统计条会诚实地藏起来直到下一轮结束。
 
@@ -158,6 +157,25 @@ node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/ds
 - 行数遵循仓库自己的 git 配置，包括 `.gitattributes` 过滤器和 `core.autocrlf`。
 - 文件清单最多 200 条；计数保持完整，清单会说明省略了多少条。
 - 宿主进程被 `SIGKILL` 时没有任何 disposer 会跑，会在系统临时目录留下每个 Session 一个 `dsh-chat-diff-legacy-*` 小目录（只含该仓库的快照对象和一份私有索引），随时删掉都是安全的。
+
+## 非 Git 工作区
+
+会话的工作目录不在任何仓库里时，插件在**临时目录里自建一个私有仓库**来测量这份目录：`git init` 只发生在该 Session 自己的 scratch 目录里，工作目录不会被写入 `.git`、索引或对象库（`tests/git.spec.ts` 里有断言）。测量仍然完全交给 git —— `add --all`、`write-tree`、`diff-tree --numstat` —— 插件自己不遍历、不哈希任何文件。
+
+- **第一遍只预热，不出数字**。首次遇到该目录时要读一遍被接受的全部文件：实测 1.7 GB / 28k 文件 + 默认忽略集 = **36.7 s**，对象库约 **810 MB**（都在临时目录里）。这一遍在后台跑，**不会**卡住工具调用；它落地的那个回合不报数字，从下一个回合起正常测量，此后每轮只是一次 stat 扫描（同一目录实测 **0.13 s**）。
+- **默认忽略集**写在私有仓库的 `info/exclude`，目录里已有的 `.gitignore` 照常生效：
+
+  ```text
+  .git/  .hg/  .svn/  node_modules/
+  dist/  build/  out/  target/  coverage/  __pycache__/  .venv/  venv/
+  *.apk  *.zip  *.7z  *.rar  *.exe  *.dll  *.so  *.dylib  *.iso  *.dmg  *.msi
+  ```
+
+- **不做行尾转换**：私有仓库里写死 `core.autocrlf=false`、`core.safecrlf=false`，统计的是磁盘上的字节，而不是某个仓库的检出策略。
+- **这一模式信任 git 的 stat 缓存**。仓库模式为了保证正确性每轮强制重哈希每个路径（见 `snapshotTree` 的注释），非仓库模式为了成本只重读变过的文件；在时间戳精度很粗的文件系统上（FAT/exFAT、部分网络盘），"改成同样长度、时间戳又恰好相同"的极端情况可能漏报。要强制重读，把目录放进一个仓库里即可（那样走的是仓库模式）。
+- **嵌在目录里的 git 仓库**按 git 自己的 embedded repository / gitlink 语义处理：它内部改了什么都**不会**逐文件报出来；只有它自己的提交前进时，统计条列出该目录一行且**不计行数**（`diffSyntheticTrees` 把 gitlink 从 git 报的 `+1 -1` 改写成不可计数，避免编造行数）。要它内部的逐文件统计，把会话 cwd 设到那个仓库里。
+- **Windows 的目录联接（junction）会被跟随**，从工作目录走出去的联接内容也会进入快照。默认忽略集覆盖依赖目录与构建产物，但不覆盖任意联接。
+- **用户级 `core.excludesFile` 只在 POSIX 上生效**：Windows 下插件交给 git 的环境不含用户 profile 路径，git 读不到 `~/.gitconfig`，所以只有目录内的 `.gitignore` 和上面的默认忽略集在起作用。
 
 ## 开发
 

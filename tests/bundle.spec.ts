@@ -142,10 +142,12 @@ describe('the target line', () => {
   test('declares the exact compatibility it was built for', async () => {
     const manifest = JSON.parse(await readFile('package.json', 'utf8')) as { dsh?: { engines?: { dsh?: string } } }
     const range = manifest.dsh?.engines?.dsh ?? ''
+    // The floor stays on the legacy line, so a 2.0.13 install keeps working.
     expect(range).toContain('0.1.5-rc.1')
-    // The brief is explicit: this build must not claim to need 0.1.6 or later.
+    // The brief is explicit: this build must not *require* 0.1.6 or later.
     expect(range).not.toMatch(/>=\s*0\.1\.[6-9]/u)
-    expect(range).toContain('<0.1.6')
+    // The ceiling covers the kernel the current desktop build ships (0.1.7-rc.2).
+    expect(range).toContain('<0.1.8')
   })
 
   test('declares React as a peer so the bundler keeps it external', async () => {

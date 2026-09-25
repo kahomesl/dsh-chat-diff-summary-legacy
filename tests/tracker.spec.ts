@@ -15,6 +15,8 @@ interface Script {
   diff?: readonly RawChange[]
   snapshot?: string | null
   locate?: boolean
+  /** Whether a private repository is minted for a directory no repository encloses. */
+  synthetic?: boolean
 }
 
 /** A scripted engine that records every call it received. */
@@ -25,10 +27,14 @@ class FakeEngine implements ChangeEngine {
   private readonly byLabel: Map<string, string | null>
   private readonly changes: readonly RawChange[]
   private readonly located: boolean
+  private readonly synthetic: boolean
+  private warmTree: string | null = 'warm-tree'
+  private measured = 0
 
   constructor(script: Script = {}) {
     this.changes = script.diff ?? []
     this.located = script.locate ?? true
+    this.synthetic = script.synthetic ?? false
     this.byLabel = new Map()
     this.byLabel.set('base', script.snapshot === undefined ? 'base-tree' : script.snapshot)
     this.byLabel.set('end', 'end-tree')
@@ -41,15 +47,34 @@ class FakeEngine implements ChangeEngine {
     this.byLabel.set(label, tree)
   }
 
+  /** Make the synthetic workspace's first, whole-directory pass answer with a tree. */
+  setWarmTree(tree: string | null): void {
+    this.warmTree = tree
+  }
+
   locate(cwd: string): Promise<GitWorkspace | null> {
     this.calls.push(`locate:${cwd}`)
     if (!this.located) return Promise.resolve(null)
     return Promise.resolve({ root: '/repo', gitDir: '/repo/.git', scratch: '/scratch', env: {}, excludes: [] })
   }
 
+  locateDirectory(cwd: string): Promise<GitWorkspace | null> {
+    this.calls.push(`locateDirectory:${cwd}`)
+    if (!this.synthetic) return Promise.resolve(null)
+    return Promise.resolve({ root: cwd, gitDir: '/scratch/directory', scratch: '/scratch', env: {}, excludes: [], synthetic: true })
+  }
+
   snapshot(_workspace: GitWorkspace, label: string): Promise<string | null> {
     this.calls.push(`snapshot:${label}`)
     return Promise.resolve(this.byLabel.get(label) ?? null)
+  }
+
+  snapshotDirectory(_workspace: GitWorkspace, warm: boolean): Promise<string | null> {
+    this.calls.push(warm ? 'warm' : 'snapshotDirectory')
+    if (warm) return Promise.resolve(this.warmTree)
+    // A fresh tree per measurement, so a baseline and its end differ.
+    this.measured += 1
+    return Promise.resolve(`directory-tree-${String(this.measured)}`)
   }
 
   diff(_workspace: GitWorkspace, before: string, after: string): Promise<RawChange[]> {
@@ -68,6 +93,11 @@ class FakeEngine implements ChangeEngine {
     this.removed.push(scratch)
     return Promise.resolve()
   }
+}
+
+/** Let an off-chain promise's callbacks run, the way a real first pass would. */
+async function flush(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
 /** A tracker over a fake engine and a live lifetime signal. */
@@ -217,14 +247,56 @@ describe('a turn', () => {
     expect(tracker.summary('deep')).toBeUndefined()
   })
 
-  test('keeps nothing when the directory is not a repository', async () => {
-    const engine = new FakeEngine({ locate: false })
+  test('keeps nothing when git cannot address the directory at all', async () => {
+    const engine = new FakeEngine({ locate: false, synthetic: false })
     const { tracker } = trackerWith(engine)
     tracker.beginTurn('s1', '/plain', undefined, 0, 1)
     tracker.endTurn('s1', 1)
     await tracker.settle('s1')
     expect(tracker.summary('s1')).toEqual({ turn: 1, files: [], total: 0, added: 0, deleted: 0 })
     expect(tracker.summary('s1')?.total).toBe(0)
+    expect(engine.calls).toEqual(['locate:/plain', 'locateDirectory:/plain'])
+  })
+
+  test('mints a private repository for a directory no repository encloses, one turn later', async () => {
+    const engine = new FakeEngine({ locate: false, synthetic: true, diff: CHANGES })
+    const { tracker } = trackerWith(engine)
+    tracker.beginTurn('s1', '/plain', undefined, 0, 1)
+    tracker.endTurn('s1', 1)
+    await tracker.settle('s1')
+    await flush()
+    // The first turn only starts the whole-directory pass, and the pass itself
+    // stays off the chain the tool gate awaits: no turn ever waits on it.
+    expect(engine.calls).toEqual(['locate:/plain', 'locateDirectory:/plain', 'warm'])
+    expect(tracker.summary('s1')).toEqual({ turn: 1, files: [], total: 0, added: 0, deleted: 0 })
+
+    tracker.beginTurn('s1', '/plain', undefined, 0, 2)
+    tracker.endTurn('s1', 2)
+    await tracker.settle('s1')
+    // The turn that begins after the pass lands is measured like any other.
+    expect(tracker.summary('s1', 2)?.total).toBe(CHANGES.length)
+    expect(tracker.summary('s1', 2)?.files.map((file) => file.path)).toEqual(['a.ts', 'src/b.ts'])
+    expect(engine.calls).toContain('snapshotDirectory')
+  })
+
+  test('reports a failed first pass once and never reads the directory again', async () => {
+    const engine = new FakeEngine({ locate: false, synthetic: true, diff: CHANGES })
+    engine.setWarmTree(null)
+    const { tracker, warnings } = trackerWith(engine)
+    tracker.beginTurn('s1', '/plain', undefined, 0, 1)
+    tracker.endTurn('s1', 1)
+    await tracker.settle('s1')
+    await flush()
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatch(/could not read the working directory/u)
+
+    tracker.beginTurn('s1', '/plain', undefined, 0, 2)
+    tracker.endTurn('s1', 2)
+    await tracker.settle('s1')
+    await flush()
+    // No repeated whole-directory pass, and no numbers invented for the turn.
+    expect(engine.calls.filter((call) => call === 'warm')).toHaveLength(1)
+    expect(tracker.summary('s1', 2)?.total).toBe(0)
   })
 
   test('does not re-serve an older turn as this turn when git refuses the snapshot', async () => {

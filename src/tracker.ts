@@ -11,17 +11,27 @@
  * Each Session owns one private scratch directory, and every git write goes
  * into it. See `git.ts` for what that guarantees, and `tests/git.spec.ts` for
  * the hashes that prove it.
+ *
+ * A Session whose working directory no repository encloses is measured the same
+ * way, through a private repository this plugin mints inside that scratch
+ * directory (`locateSyntheticWorkspace`). Its first pass reads the whole
+ * directory once and is never allowed to hold the tool gate; the turn that
+ * starts it reports nothing, and every later turn costs a stat walk.
  */
 import type { CommandRunner, GitLogger, GitWorkspace, RawChange } from './git.ts'
-import { createScratch, diffTrees, gitEnvironment, locateWorkspace, removeScratch, resolveGit, snapshotTree } from './git.ts'
+import { GIT_TIMEOUT_MS, GIT_WARMUP_TIMEOUT_MS, createScratch, diffSyntheticTrees, diffTrees, gitEnvironment, locateSyntheticWorkspace, locateWorkspace, removeScratch, resolveGit, snapshotSyntheticTree, snapshotTree } from './git.ts'
 import { MAX_FILES, MAX_RETAINED_TURNS, type ChangeSummary } from './summary.ts'
 
 /** The snapshot operations the tracker needs; injected so it can be unit-tested without git. */
 export interface ChangeEngine {
   /** Resolve the repository enclosing `cwd`, or null when it is not inside one. */
   locate(cwd: string, scratch: string, signal: AbortSignal): Promise<GitWorkspace | null>
+  /** Mint a private repository for a directory no repository encloses, or null when git refused. */
+  locateDirectory(cwd: string, scratch: string, signal: AbortSignal): Promise<GitWorkspace | null>
   /** Write the work tree as a tree object under `label`'s private index, or null when git refused. */
   snapshot(workspace: GitWorkspace, label: string, signal: AbortSignal): Promise<string | null>
+  /** Refresh a synthetic workspace's own index; `warm` selects the first, whole-directory bound. */
+  snapshotDirectory(workspace: GitWorkspace, warm: boolean, signal: AbortSignal): Promise<string | null>
   /** Per-file counts between two snapshot trees. */
   diff(workspace: GitWorkspace, before: string, after: string, signal: AbortSignal): Promise<RawChange[]>
   /** Create one Session's private scratch directory. */
@@ -29,6 +39,9 @@ export interface ChangeEngine {
   /** Remove one Session's private scratch directory. */
   removeScratch(scratch: string): Promise<void>
 }
+
+/** How far a synthetic workspace's first, whole-directory pass has got. */
+type WarmState = 'cold' | 'warming' | 'ready' | 'failed'
 
 /** One Session's open-turn state. */
 interface SessionRecord {
@@ -39,6 +52,10 @@ interface SessionRecord {
   scratch: string | undefined
   /** The located repository; `null` means the last attempt found none and the next turn retries. */
   workspace: GitWorkspace | null | undefined
+  /** How far a synthetic workspace's first, whole-directory pass has got. */
+  warm: WarmState
+  /** That pass, while it runs; disposal waits for it before deleting the scratch. */
+  warmWork: Promise<void> | undefined
   /** The turn the state below belongs to. */
   turn: number
   /** The turn-start tree, or null when this turn has no usable baseline. */
@@ -106,8 +123,12 @@ export function summarize(turn: number, changes: readonly RawChange[]): ChangeSu
 export function createGitEngine(runner: CommandRunner, executable: string, environment: Readonly<Record<string, string>>): ChangeEngine {
   return {
     locate: (cwd, scratch, signal) => locateWorkspace(runner, executable, environment, cwd, () => Promise.resolve(scratch), signal),
+    locateDirectory: (cwd, scratch, signal) => locateSyntheticWorkspace(runner, executable, environment, cwd, scratch, signal),
     snapshot: (workspace, label, signal) => snapshotTree(runner, executable, workspace, `${workspace.scratch}/index-${label}`, workspace.excludes, signal),
-    diff: (workspace, before, after, signal) => diffTrees(runner, executable, workspace, before, after, signal),
+    snapshotDirectory: (workspace, warm, signal) => snapshotSyntheticTree(runner, executable, workspace, warm ? GIT_WARMUP_TIMEOUT_MS : GIT_TIMEOUT_MS, signal),
+    diff: (workspace, before, after, signal) => workspace.synthetic === true
+      ? diffSyntheticTrees(runner, executable, workspace, before, after, signal)
+      : diffTrees(runner, executable, workspace, before, after, signal),
     createScratch: () => createScratch('dsh-chat-diff-legacy'),
     removeScratch: (scratch) => removeScratch(scratch),
   }
@@ -142,7 +163,9 @@ export class TurnTracker {
    *
    * The snapshot is asynchronous because it is a real git call; the host gates
    * tool dispatch on {@link settle}, so nothing can mutate the work tree between
-   * the turn's first tool call and the baseline being written.
+   * the turn's first tool call and the baseline being written. A synthetic
+   * workspace's first pass is the one exception: it is started here, and this
+   * turn is deliberately left without a baseline rather than holding the gate.
    * @param sessionId - the Session whose turn opened.
    * @param cwd - the Session working directory, absent for a Session without one.
    * @param origin - the Session's coarse product origin.
@@ -161,7 +184,16 @@ export class TurnTracker {
       if (engine === null) return
       const workspace = await this.workspaceFor(engine, record, cwd, signal)
       if (workspace === null) return
-      const tree = await engine.snapshot(workspace, 'base', signal)
+      if (workspace.synthetic === true && record.warm !== 'ready') {
+        // A synthetic workspace's first pass reads the whole directory, so it is
+        // never allowed to hold the turn's tool gate: this turn reports nothing,
+        // and the first turn that begins after the pass lands is measured
+        // normally. The pass itself runs off the Session's chain for the same
+        // reason — the gate awaits that chain.
+        this.warmUp(engine, record, workspace, signal)
+        return
+      }
+      const tree = await this.snapshotIn(engine, workspace, 'base', signal)
       if (record.turn === turn) record.baseline = tree
     })
   }
@@ -194,7 +226,7 @@ export class TurnTracker {
         if (engine === null) return
         const workspace = record.workspace ?? null
         if (workspace === null) return
-        const tree = await engine.snapshot(workspace, 'live', signal)
+        const tree = await this.snapshotIn(engine, workspace, 'live', signal)
         if (tree === null) return
         const changes = await engine.diff(workspace, baseline, tree, signal)
         // The turn may have ended, or a new one opened, while git ran.
@@ -237,7 +269,7 @@ export class TurnTracker {
         this.remember(record, emptySummary(turn))
         return
       }
-      const end = await engine.snapshot(workspace, 'end', signal)
+      const end = await this.snapshotIn(engine, workspace, 'end', signal)
       if (end === null) {
         this.remember(record, emptySummary(turn))
         return
@@ -308,7 +340,11 @@ export class TurnTracker {
     const record = this.sessions.get(sessionId)
     if (record === undefined) return
     this.sessions.delete(sessionId)
-    await record.chain
+    // The first pass of a synthetic workspace runs off the chain, so it is
+    // awaited here separately: deleting the scratch out from under it would be a
+    // race, not a cleanup. Plugin disposal aborts the lifetime before this runs,
+    // which is what bounds the wait.
+    await Promise.all([record.chain, record.warmWork])
     if (record.scratch === undefined) return
     const engine = await this.engine()
     await engine?.removeScratch(record.scratch).catch(() => {})
@@ -328,6 +364,8 @@ export class TurnTracker {
       chain: Promise.resolve(),
       scratch: undefined,
       workspace: undefined,
+      warm: 'cold',
+      warmWork: undefined,
       turn: 0,
       baseline: null,
       progressQueued: false,
@@ -360,13 +398,60 @@ export class TurnTracker {
     }
   }
 
-  /** Locate the Session's repository once, retrying while no repository exists yet. */
+  /**
+   * Resolve the Session's workspace once: the repository enclosing `cwd`, or a
+   * private repository minted here when no repository encloses it.
+   *
+   * A Session keeps the workspace it first resolved, because a baseline tree only
+   * means anything in the object store it was written to, and switching stores
+   * mid-Session would compare a tree the other store cannot resolve. A directory
+   * that gains a repository later is measured by the repository path from the
+   * next Session on.
+   * @param engine - the resolved snapshot engine.
+   * @param record - the Session's record.
+   * @param cwd - the Session working directory.
+   * @param signal - cancellation.
+   * @returns the workspace, or null when git could not address the directory at all.
+   */
   private async workspaceFor(engine: ChangeEngine, record: SessionRecord, cwd: string, signal: AbortSignal): Promise<GitWorkspace | null> {
     if (record.workspace !== undefined && record.workspace !== null) return record.workspace
     record.scratch ??= await engine.createScratch()
     const located = await engine.locate(cwd, record.scratch, signal)
-    record.workspace = located
-    return located
+    record.workspace = located ?? await engine.locateDirectory(cwd, record.scratch, signal)
+    return record.workspace
+  }
+
+  /** Snapshot the work tree the way this Session's workspace is measured. */
+  private async snapshotIn(engine: ChangeEngine, workspace: GitWorkspace, label: string, signal: AbortSignal): Promise<string | null> {
+    if (workspace.synthetic === true) return engine.snapshotDirectory(workspace, false, signal)
+    return engine.snapshot(workspace, label, signal)
+  }
+
+  /**
+   * Run a synthetic workspace's first pass, off the Session's chain.
+   *
+   * Every later measurement reuses the index this pass builds, so it runs once
+   * per Session. A pass that fails is not retried: retrying it would mean reading
+   * the whole directory again on every turn, which is the cost this design exists
+   * to avoid. Disposal waits for the pass through {@link SessionRecord.warmWork}.
+   * @param engine - the resolved snapshot engine.
+   * @param record - the Session's record.
+   * @param workspace - the synthetic workspace to read once.
+   * @param signal - cancellation.
+   */
+  private warmUp(engine: ChangeEngine, record: SessionRecord, workspace: GitWorkspace, signal: AbortSignal): void {
+    if (record.warm !== 'cold') return
+    record.warm = 'warming'
+    const settled = (state: WarmState, detail?: string): void => {
+      record.warm = state
+      if (detail !== undefined) this.logger.warn(`chat-diff-summary-legacy: session "${record.sessionId}": ${detail}`)
+    }
+    record.warmWork = engine.snapshotDirectory(workspace, true, signal).then(
+      (tree) => settled(tree === null ? 'failed' : 'ready', tree === null ? 'could not read the working directory; change summaries stay hidden for this Session' : undefined),
+      // A pass that plugin disposal killed is not a failure worth reporting.
+      (error: unknown) => settled('failed', signal.aborted ? undefined : `could not read the working directory: ${error instanceof Error ? error.message : String(error)}`),
+    )
+    void record.warmWork
   }
 }
 

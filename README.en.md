@@ -7,8 +7,9 @@ A Codex-style per-turn change summary bar above the composer, built for the
 [ 1 个文件已更改                            +542   -20 ]
 ```
 
-- **Kernel range: `>=0.1.5-rc.1 <0.1.6`**, verified on `0.1.5-rc.2` — the kernel
-  DSH Desktop 2.0.13 ships. See [Compatibility](#compatibility).
+- **Kernel range: `>=0.1.5-rc.1 <0.1.8`**, verified on `0.1.5-rc.2` (the kernel
+  DSH Desktop 2.0.13 ships) and on `0.1.7-rc.2` (the kernel the current desktop
+  build ships). See [Compatibility](#compatibility).
 - Changed-file count in ordinary text; `+added` in the success token and
   `-deleted` in the error token; one 38px row, 14px radius, 1px border, no heavy
   shadow, no gradient, no glass effect.
@@ -166,15 +167,15 @@ guard.
 
 | | |
 |---|---|
-| **Declared** | `>=0.1.5-rc.1 <0.1.6` — `dsh.engines.dsh` in `package.json` |
-| **Verified** | `0.1.5-rc.2`, the kernel shipped by DSH Desktop 2.0.13 |
-| **Untested** | `0.1.5-rc.1` and other 0.1.5-line patches |
-| **Out of scope** | `0.1.6` and later |
+| **Declared** | `>=0.1.5-rc.1 <0.1.8` — `dsh.engines.dsh` in `package.json` |
+| **Verified** | `0.1.5-rc.2` (the kernel DSH Desktop 2.0.13 ships) and `0.1.7-rc.2` (the kernel the current desktop build ships) |
+| **Untested** | `0.1.5-rc.1`, the 0.1.6 line, and other patches on either line |
+| **Out of scope** | `0.1.8` and later |
 
 **The Desktop version and the kernel version are two different numbers.** DSH
 Desktop is on `2.0.x`; the DeepSeek Harness kernel is on `0.1.x`. This plugin has
-been exercised against exactly one pairing: **DSH Desktop 2.0.13 + kernel
-0.1.5-rc.2**.
+been exercised against two pairings: **DSH Desktop 2.0.13 + kernel 0.1.5-rc.2**
+and **the current desktop build + kernel 0.1.7-rc.2**.
 
 To read the kernel version you actually have:
 
@@ -184,11 +185,13 @@ node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/ds
 # → 0.1.5-rc.2
 ```
 
-**Why the upper bound is `0.1.6`.** Every host surface this plugin touches exists
+**Why the upper bound is `0.1.8`.** Every host surface this plugin touches exists
 in the 0.1.5 line: the `conversation.input.dock` slot, route registration through
 `ctx.connection.fetch`, and the `session/event` and `tools/pre-execute` events.
-`0.1.6-alpha.2` and `0.1.7-rc.1` do exist, but this plugin uses nothing they
-introduced and has never been run against them, so the range stops at `<0.1.6`.
+Every one of them is still present in `0.1.7-rc.2` (`ctx.sessions.binding(id)`
+still answers `{ sessionId, session, eventSource, ctx }`), so the ceiling was
+raised to cover the kernel the current desktop build ships; the 0.1.6 line is
+untested and `0.1.8` and later are out of scope.
 
 **The field is a declaration, not a gate.** `dsh.engines.dsh` is the same field
 `@linxin666/*` and other third-party plugins use (inside the `dsh` object,
@@ -198,9 +201,6 @@ tested — it is not a runtime version check.
 
 ## What is deliberately not implemented
 
-- **Non-Git workspaces.** Legacy 2.0.13 version currently supports Git
-  workspaces only. A directory that is not inside a repository produces no
-  summary, and the plugin never scans the tree to hash files.
 - **Diff review.** 0.1.5-rc.2 has no `changes-review` surface, so clicking the
   bar only expands and collapses a compact file list. File names are plain text,
   not links.
@@ -224,6 +224,54 @@ tested — it is not a runtime version check.
   Session it was tracking under the system temporary root, named
   `dsh-chat-diff-legacy-*`. They hold only that repository's snapshot objects and
   a private index, and removing them is always safe.
+
+## Non-Git workspaces
+
+When a Session's working directory is not inside any repository, the plugin mints
+a **private repository inside the Session's own scratch directory** and measures
+the directory with it: `git init` happens there alone, so the measured directory
+gains no `.git`, no index and no object store (`tests/git.spec.ts` asserts it).
+The measurement is still entirely git's — `add --all`, `write-tree`,
+`diff-tree --numstat`; no file is walked or hashed by this plugin.
+
+- **The first pass only warms up; it reports no numbers.** Reading every accepted
+  file once measured **36.7 s** and about **810 MB** of temporary object store on
+  a 1.7 GB / 28k-file directory with the default excludes. That pass runs in the
+  background — it never holds a tool call — the turn it lands in reports nothing,
+  and the next turn is measured normally. From then on a turn costs a stat walk:
+  **0.13 s** on the same directory.
+- **Default ignore rules** live in the private repository's `info/exclude`; a
+  `.gitignore` inside the directory still applies:
+
+  ```text
+  .git/  .hg/  .svn/  node_modules/
+  dist/  build/  out/  target/  coverage/  __pycache__/  .venv/  venv/
+  *.apk  *.zip  *.7z  *.rar  *.exe  *.dll  *.so  *.dylib  *.iso  *.dmg  *.msi
+  ```
+
+- **No line-ending translation**: the private repository pins
+  `core.autocrlf=false` and `core.safecrlf=false`, so counts describe the bytes on
+  disk rather than one repository's checkout policy.
+- **This mode trusts git's stat cache.** The repository path re-hashes every path
+  on every turn for correctness (see `snapshotTree`); the private-repository path
+  re-reads only what changed, because reading everything again is what it exists
+  to avoid. On a filesystem with coarse timestamps (FAT/exFAT, some network
+  shares) an edit that keeps both a file's size and its recorded timestamps can be
+  missed. A directory that needs the strict behaviour belongs in a repository,
+  where the repository path runs.
+- **A repository embedded in the directory** follows git's own embedded-repository
+  (gitlink) semantics: nothing inside it is reported file by file, and when its own
+  commit advances the bar lists that directory as one entry **without line counts**
+  (`diffSyntheticTrees` rewrites the `+1 -1` git reports for a gitlink, so no line
+  count is invented). For per-file detail inside it, point the Session's working
+  directory at that repository.
+- **A Windows directory junction is followed**, so content reachable through one
+  enters the snapshot. The default excludes cover dependency trees and build
+  output, not arbitrary junctions.
+- **A user-level `core.excludesFile` applies on POSIX only**: on Windows the
+  environment this plugin hands git carries no user profile path, so git cannot
+  read `~/.gitconfig` and only the directory's own `.gitignore` and the default
+  rules above apply.
 
 ## Install
 

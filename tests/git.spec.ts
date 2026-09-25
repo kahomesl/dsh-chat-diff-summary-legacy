@@ -9,17 +9,21 @@
  * refs, and the object store are all hashed around every snapshot below.
  */
 import { describe, expect, test } from 'vitest'
-import { readFile, stat } from 'node:fs/promises'
+import { readFile, mkdir, readdir, realpath, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
+  GIT_TIMEOUT_MS,
   createScratch,
+  diffSyntheticTrees,
   diffTrees,
   gitEnvironment,
+  locateSyntheticWorkspace,
   locateWorkspace,
   parseNumstat,
   removeScratch,
   resolveGit,
   runCommand,
+  snapshotSyntheticTree,
   snapshotTree,
 } from '../src/git.ts'
 import { cleanup, commitAll, fileDigest, git, makeDir, makeRepo, treeDigest, write } from './support/repo.ts'
@@ -299,6 +303,98 @@ describe('the private scratch directory', () => {
       expect(await git(repo, ['diff', '--cached', '--name-only'])).toBe('')
     } finally {
       await cleanup(repo, scratch)
+    }
+  })
+})
+
+describe('a directory no repository encloses', () => {
+  test('gets a private repository the directory itself never sees', async () => {
+    const plain = await makeDir('dsh-synthetic')
+    const scratch = await createScratch('dsh-probe')
+    try {
+      await write(plain, 'a.txt', 'one\n')
+      const workspace = await locateSyntheticWorkspace(runCommand, executable, environment, plain, scratch, new AbortController().signal)
+      expect(workspace?.synthetic).toBe(true)
+      expect(workspace?.root).toBe(await realpath(plain))
+      expect(workspace?.gitDir).toBe(join(scratch, 'directory', '.git'))
+      // The measured directory is untouched: no `.git`, no index, nothing.
+      expect(await readdir(plain)).toEqual(['a.txt'])
+    } finally {
+      await cleanup(plain, scratch)
+    }
+  })
+
+  test('measures one turn from the tree it opened with', async () => {
+    const plain = await makeDir('dsh-synthetic-turn')
+    const scratch = await createScratch('dsh-probe')
+    const signal = new AbortController().signal
+    try {
+      await write(plain, 'a.txt', 'one\ntwo\n')
+      const workspace = await locateSyntheticWorkspace(runCommand, executable, environment, plain, scratch, signal)
+      if (workspace === null) throw new Error('a private repository was refused')
+      const before = await snapshotSyntheticTree(runCommand, executable, workspace, GIT_TIMEOUT_MS, signal)
+      await write(plain, 'a.txt', 'one\ntwo\nthree\n')
+      await write(plain, 'fresh.txt', 'new\n')
+      const after = await snapshotSyntheticTree(runCommand, executable, workspace, GIT_TIMEOUT_MS, signal)
+      if (before === null || after === null) throw new Error('a snapshot was refused')
+      expect(await diffTrees(runCommand, executable, workspace, before, after, signal)).toEqual([
+        { path: 'a.txt', added: 1, deleted: 0, binary: false },
+        { path: 'fresh.txt', added: 1, deleted: 0, binary: false },
+      ])
+    } finally {
+      await cleanup(plain, scratch)
+    }
+  })
+
+  test('applies the default excludes, so a dependency tree is never read', async () => {
+    const plain = await makeDir('dsh-synthetic-excludes')
+    const scratch = await createScratch('dsh-probe')
+    const signal = new AbortController().signal
+    try {
+      await write(plain, 'kept.txt', 'one\n')
+      await write(plain, 'node_modules/dep/index.js', 'module.exports = 1\n')
+      const workspace = await locateSyntheticWorkspace(runCommand, executable, environment, plain, scratch, signal)
+      if (workspace === null) throw new Error('a private repository was refused')
+      const before = await snapshotSyntheticTree(runCommand, executable, workspace, GIT_TIMEOUT_MS, signal)
+      await write(plain, 'kept.txt', 'one\ntwo\n')
+      await write(plain, 'node_modules/dep/index.js', 'module.exports = 2\nmodule.exports = 3\n')
+      const after = await snapshotSyntheticTree(runCommand, executable, workspace, GIT_TIMEOUT_MS, signal)
+      if (before === null || after === null) throw new Error('a snapshot was refused')
+      const changes = await diffTrees(runCommand, executable, workspace, before, after, signal)
+      expect(changes.map((change) => change.path)).toEqual(['kept.txt'])
+    } finally {
+      await cleanup(plain, scratch)
+    }
+  })
+
+  test('reports an embedded repository without inventing a line count', async () => {
+    const plain = await makeDir('dsh-synthetic-nested')
+    const scratch = await createScratch('dsh-probe')
+    const signal = new AbortController().signal
+    try {
+      await write(plain, 'kept.txt', 'one\n')
+      const inner = join(plain, 'nested')
+      await mkdir(inner, { recursive: true })
+      await git(inner, ['init', '-q', '.'])
+      await git(inner, ['config', 'user.email', 'harness@example.invalid'])
+      await git(inner, ['config', 'user.name', 'Harness'])
+      await write(inner, 'inner.txt', 'one\n')
+      await commitAll(inner, 'init')
+      const workspace = await locateSyntheticWorkspace(runCommand, executable, environment, plain, scratch, signal)
+      if (workspace === null) throw new Error('a private repository was refused')
+      const before = await snapshotSyntheticTree(runCommand, executable, workspace, GIT_TIMEOUT_MS, signal)
+      await write(inner, 'inner.txt', 'one\ntwo\n')
+      await commitAll(inner, 'second')
+      const after = await snapshotSyntheticTree(runCommand, executable, workspace, GIT_TIMEOUT_MS, signal)
+      if (before === null || after === null) throw new Error('a snapshot was refused')
+      // git records the directory as an embedded repository and calls the moved
+      // pointer one added and one deleted line; nobody changed a line, so the
+      // entry is reported as one without counts.
+      expect(await diffSyntheticTrees(runCommand, executable, workspace, before, after, signal)).toEqual([
+        { path: 'nested', added: 0, deleted: 0, binary: true },
+      ])
+    } finally {
+      await cleanup(plain, scratch)
     }
   })
 })

@@ -83,6 +83,7 @@ interface HostContext {
 }
 //#endregion
 //#region src/git.d.ts
+
 /** The repository enclosing a Session working directory, and the private store its snapshots write to. */
 interface GitWorkspace {
   /** Repository top level; the root every reported diff path is relative to. */
@@ -95,6 +96,16 @@ interface GitWorkspace {
   readonly env: Readonly<Record<string, string>>;
   /** Work-tree paths a snapshot must skip: the private directory, when it happens to lie inside the work tree. */
   readonly excludes: readonly string[];
+  /**
+   * True when this workspace was minted for a directory no repository encloses.
+   *
+   * A synthetic workspace carries its own private repository: `gitDir` is a
+   * directory this plugin created under `scratch`, `env` points git at it, and
+   * the work tree is the Session's own directory. Nothing is written inside the
+   * work tree — the only trace of the workspace is `scratch`, which the Session
+   * removes when it ends.
+   */
+  readonly synthetic?: true;
 }
 /** One changed path between two snapshot trees. */
 interface RawChange {
@@ -142,8 +153,12 @@ interface ChangeSummary {
 interface ChangeEngine {
   /** Resolve the repository enclosing `cwd`, or null when it is not inside one. */
   locate(cwd: string, scratch: string, signal: AbortSignal): Promise<GitWorkspace | null>;
+  /** Mint a private repository for a directory no repository encloses, or null when git refused. */
+  locateDirectory(cwd: string, scratch: string, signal: AbortSignal): Promise<GitWorkspace | null>;
   /** Write the work tree as a tree object under `label`'s private index, or null when git refused. */
   snapshot(workspace: GitWorkspace, label: string, signal: AbortSignal): Promise<string | null>;
+  /** Refresh a synthetic workspace's own index; `warm` selects the first, whole-directory bound. */
+  snapshotDirectory(workspace: GitWorkspace, warm: boolean, signal: AbortSignal): Promise<string | null>;
   /** Per-file counts between two snapshot trees. */
   diff(workspace: GitWorkspace, before: string, after: string, signal: AbortSignal): Promise<RawChange[]>;
   /** Create one Session's private scratch directory. */
@@ -168,7 +183,9 @@ declare class TurnTracker {
    *
    * The snapshot is asynchronous because it is a real git call; the host gates
    * tool dispatch on {@link settle}, so nothing can mutate the work tree between
-   * the turn's first tool call and the baseline being written.
+   * the turn's first tool call and the baseline being written. A synthetic
+   * workspace's first pass is the one exception: it is started here, and this
+   * turn is deliberately left without a baseline rather than holding the gate.
    * @param sessionId - the Session whose turn opened.
    * @param cwd - the Session working directory, absent for a Session without one.
    * @param origin - the Session's coarse product origin.
@@ -239,8 +256,37 @@ declare class TurnTracker {
   private enqueue;
   /** Store one summary, keeping only the newest {@link MAX_RETAINED_TURNS} turns. */
   private remember;
-  /** Locate the Session's repository once, retrying while no repository exists yet. */
+  /**
+   * Resolve the Session's workspace once: the repository enclosing `cwd`, or a
+   * private repository minted here when no repository encloses it.
+   *
+   * A Session keeps the workspace it first resolved, because a baseline tree only
+   * means anything in the object store it was written to, and switching stores
+   * mid-Session would compare a tree the other store cannot resolve. A directory
+   * that gains a repository later is measured by the repository path from the
+   * next Session on.
+   * @param engine - the resolved snapshot engine.
+   * @param record - the Session's record.
+   * @param cwd - the Session working directory.
+   * @param signal - cancellation.
+   * @returns the workspace, or null when git could not address the directory at all.
+   */
   private workspaceFor;
+  /** Snapshot the work tree the way this Session's workspace is measured. */
+  private snapshotIn;
+  /**
+   * Run a synthetic workspace's first pass, off the Session's chain.
+   *
+   * Every later measurement reuses the index this pass builds, so it runs once
+   * per Session. A pass that fails is not retried: retrying it would mean reading
+   * the whole directory again on every turn, which is the cost this design exists
+   * to avoid. Disposal waits for the pass through {@link SessionRecord.warmWork}.
+   * @param engine - the resolved snapshot engine.
+   * @param record - the Session's record.
+   * @param workspace - the synthetic workspace to read once.
+   * @param signal - cancellation.
+   */
+  private warmUp;
 }
 /** Resolve the real engine, or null when this host has no usable git. */
 type EngineProvider = () => Promise<ChangeEngine | null>;

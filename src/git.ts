@@ -11,7 +11,7 @@
  * probe that `snapshotTree` documents.
  */
 import { spawn } from 'node:child_process'
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -41,6 +41,17 @@ export const GIT_TIMEOUT_MS = 30_000
 /** In-memory stdout cap for one git call. */
 export const GIT_MAX_BYTES = 8 * 1024 * 1024
 
+/**
+ * Bound for the single pass that mints a synthetic workspace's first tree.
+ *
+ * That pass reads every accepted file once, so it is the only git call in this
+ * plugin whose cost scales with the whole directory rather than with a turn:
+ * measured on a 1.7 GB / 28k-file directory with the default excludes, it took
+ * 36.7 s. Every later pass re-reads only what changed. The larger bound exists so
+ * a big directory is allowed to finish instead of being abandoned at 30 s.
+ */
+export const GIT_WARMUP_TIMEOUT_MS = 10 * 60_000
+
 /** Environment entries carried into every git call; everything else is scrubbed. */
 const PASSTHROUGH = ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'SHELL', 'LANG', 'LC_ALL', 'TZ', 'SystemRoot', 'ComSpec', 'PATHEXT', 'SystemDrive']
 
@@ -59,6 +70,16 @@ export interface GitWorkspace {
   readonly env: Readonly<Record<string, string>>
   /** Work-tree paths a snapshot must skip: the private directory, when it happens to lie inside the work tree. */
   readonly excludes: readonly string[]
+  /**
+   * True when this workspace was minted for a directory no repository encloses.
+   *
+   * A synthetic workspace carries its own private repository: `gitDir` is a
+   * directory this plugin created under `scratch`, `env` points git at it, and
+   * the work tree is the Session's own directory. Nothing is written inside the
+   * work tree — the only trace of the workspace is `scratch`, which the Session
+   * removes when it ends.
+   */
+  readonly synthetic?: true
 }
 
 /** One changed path between two snapshot trees. */
@@ -244,6 +265,190 @@ export async function snapshotTree(runner: CommandRunner, executable: string, wo
   if (written.exitCode !== 0) return null
   const tree = written.stdout.trim()
   return /^[0-9a-f]{40,64}$/u.test(tree) ? tree : null
+}
+
+/**
+ * Ignore patterns a synthetic workspace starts with.
+ *
+ * Nothing else can supply them: the directory has no repository, so it has no
+ * ignore rules written for a repository root and no store to hold them. A
+ * `.gitignore` found *inside* the directory still applies, because git resolves
+ * those through the private repository too; this list is added on top of it. A
+ * user-level `core.excludesFile` applies only where git can find the user's own
+ * configuration — on POSIX, where `HOME` survives into these calls, and not on
+ * Windows, where this plugin's scrubbed environment carries no profile path.
+ *
+ * The set is about cost rather than taste. The first pass reads every file it
+ * accepts, so it skips source-control stores, dependency trees, build output,
+ * and the archives and binaries that carry no line counts to report in the first
+ * place. The README lists the same patterns for readers.
+ */
+export const SYNTHETIC_EXCLUDES = [
+  '# Source-control stores and dependency trees.',
+  '.git/',
+  '.hg/',
+  '.svn/',
+  'node_modules/',
+  '# Build output and caches.',
+  'dist/',
+  'build/',
+  'out/',
+  'target/',
+  'coverage/',
+  '__pycache__/',
+  '.venv/',
+  'venv/',
+  '# Archives and binaries: no line counts, and they dominate the first pass.',
+  '*.apk',
+  '*.zip',
+  '*.7z',
+  '*.rar',
+  '*.exe',
+  '*.dll',
+  '*.so',
+  '*.dylib',
+  '*.iso',
+  '*.dmg',
+  '*.msi',
+].join('\n') + '\n'
+
+/**
+ * Mint a private workspace for a directory that no repository encloses.
+ *
+ * The result is a real repository, but not one the user owns: `git init` creates
+ * it inside `scratch`, every later call addresses it through `GIT_DIR` and
+ * `GIT_WORK_TREE`, and the measured directory therefore gains no `.git`, no
+ * index and no object store of its own. Its ignore rules come from the private
+ * repository's `info/exclude`; the three configuration values below are what a
+ * byte-faithful measurement needs — no line-ending translation on add
+ * (`core.autocrlf`, `core.safecrlf`), and no advice line when the directory
+ * happens to hold a repository of its own, which git records as an embedded
+ * repository instead of walking into it.
+ *
+ * @param runner - the injected subprocess runner.
+ * @param executable - the resolved git executable.
+ * @param env - the scrubbed environment.
+ * @param cwd - absolute Session working directory, outside any repository.
+ * @param scratch - this Session's private directory; the repository is created inside it.
+ * @param signal - cancellation.
+ * @returns the synthetic workspace, or null when git refused to create one.
+ */
+export async function locateSyntheticWorkspace(runner: CommandRunner, executable: string, env: Readonly<Record<string, string>>, cwd: string, scratch: string, signal: AbortSignal): Promise<GitWorkspace | null> {
+  let root: string
+  try {
+    root = await realpath(cwd)
+  } catch {
+    // A working directory that no longer exists cannot be measured.
+    return null
+  }
+  const repository = join(scratch, 'directory')
+  // Only a directory git itself calls "not a git repository" may be measured this
+  // way. Every other rev-parse failure — a corrupt `.git`, a `safe.directory`
+  // refusal, a `.git` file pointing at a missing directory — stays the repository
+  // path's problem: it is retried there next turn, never silently replaced by a
+  // store this plugin owns. Git's own words are read in the C locale so the test
+  // does not depend on the user's language.
+  const outside = await runner({ file: executable, args: ['rev-parse', '--show-toplevel'], cwd: root, env: { ...env, LC_ALL: 'C' }, timeoutMs: 10_000, maxBytes: 64 * 1024, signal })
+  if (outside.exitCode === 0 || !/not a git repository/u.test(outside.stderr)) return null
+  await mkdir(repository, { recursive: true })
+  const created = await runner({ file: executable, args: ['init', '--quiet', repository], cwd: root, env, timeoutMs: 10_000, maxBytes: 64 * 1024, signal })
+  if (created.exitCode !== 0) return null
+  // `git init <dir>` puts the repository in `<dir>/.git`; addressing that is what
+  // makes every later call see a repository at all.
+  const gitDir = join(repository, '.git')
+  await mkdir(join(gitDir, 'info'), { recursive: true })
+  await writeFile(join(gitDir, 'info', 'exclude'), SYNTHETIC_EXCLUDES, 'utf8')
+  // Addressed by file rather than by repository discovery: `git config` refuses
+  // to discover a repository from `GIT_DIR` alone when the working directory is
+  // not one, and a refusal here would abandon the whole workspace.
+  for (const [key, value] of [['core.autocrlf', 'false'], ['core.safecrlf', 'false'], ['advice.addEmbeddedRepo', 'false']] as const) {
+    const configured = await runner({ file: executable, args: ['config', '--file', join(gitDir, 'config'), key, value], cwd: root, env, timeoutMs: 10_000, maxBytes: 64 * 1024, signal })
+    if (configured.exitCode !== 0) return null
+  }
+  return {
+    root,
+    gitDir,
+    scratch,
+    env: { ...env, GIT_DIR: gitDir, GIT_WORK_TREE: root },
+    excludes: isInside(root, scratch) ? [toPosix(relative(root, scratch))] : [],
+    synthetic: true,
+  }
+}
+
+/**
+ * Refresh a synthetic workspace's index and return the tree it now states.
+ *
+ * Unlike {@link snapshotTree}, this snapshot keeps its index. The index is the
+ * synthetic workspace's memory: the stat data it carries is what turns a
+ * measurement into a stat walk instead of a full read — the directory that takes
+ * 36.7 s to read once costs 0.13 s to re-check. That is the one place in this
+ * plugin where a stat cache is trusted, and it can, on a filesystem with coarse
+ * timestamps, miss an edit that preserves both a file's size and its recorded
+ * timestamps. Git's own racy-timestamp rule already re-reads anything not
+ * strictly older than the index, which is the case that actually happens. A
+ * directory whose owner wants the repository path's forced re-read belongs in a
+ * repository, where that path runs.
+ *
+ * @param runner - the injected subprocess runner.
+ * @param executable - the resolved git executable.
+ * @param workspace - the synthetic workspace.
+ * @param timeoutMs - bound for the add; the first pass needs more of it than a turn does.
+ * @param signal - cancellation.
+ * @returns the tree object id, or null when git refused the snapshot.
+ */
+export async function snapshotSyntheticTree(runner: CommandRunner, executable: string, workspace: GitWorkspace, timeoutMs: number, signal: AbortSignal): Promise<string | null> {
+  const pathspec = workspace.excludes.length === 0 ? [] : ['--', '.', ...workspace.excludes.map((path) => `:(exclude)${path}`)]
+  // `--ignore-errors` skips unreadable files and reports them through exit 1; the index is still complete.
+  const added = await runner({ file: executable, args: ['add', '--all', '--ignore-errors', ...pathspec], cwd: workspace.root, env: workspace.env, timeoutMs, maxBytes: GIT_MAX_BYTES, signal })
+  if (added.exitCode !== 0 && added.exitCode !== 1) return null
+  const written = await runner({ file: executable, args: ['write-tree'], cwd: workspace.root, env: workspace.env, timeoutMs: GIT_TIMEOUT_MS, maxBytes: 64 * 1024, signal })
+  if (written.exitCode !== 0) return null
+  const tree = written.stdout.trim()
+  return /^[0-9a-f]{40,64}$/u.test(tree) ? tree : null
+}
+
+/**
+ * Per-file counts between two snapshot trees of a synthetic workspace.
+ *
+ * Same measurement as {@link diffTrees}, with one correction that only a
+ * synthetic workspace needs. A directory inside the measured tree that holds a
+ * repository of its own is recorded by git as an embedded repository — a
+ * gitlink, not a directory of files — and `--numstat` then reports the pointer
+ * it moved as one added and one deleted line. Nobody changed a line. An entry
+ * like that is re-reported as a binary file, which the bar draws as a name
+ * without counts, and the README says so.
+ *
+ * @param runner - the injected subprocess runner.
+ * @param executable - the resolved git executable.
+ * @param workspace - the addressed synthetic workspace.
+ * @param before - turn-start tree id.
+ * @param after - turn-end tree id.
+ * @param signal - cancellation.
+ * @returns changed files relative to the Session working directory.
+ * @throws when git fails or the output exceeded the cap.
+ */
+export async function diffSyntheticTrees(runner: CommandRunner, executable: string, workspace: GitWorkspace, before: string, after: string, signal: AbortSignal): Promise<RawChange[]> {
+  const changes = await diffTrees(runner, executable, workspace, before, after, signal)
+  if (changes.length === 0) return changes
+  const listed = await runner({
+    file: executable,
+    args: ['ls-files', '-s', '-z', '--', ...changes.map((change) => change.path)],
+    cwd: workspace.root,
+    // A changed path is a path, not a pattern: `*` and `[` are ordinary bytes here.
+    env: { ...workspace.env, GIT_LITERAL_PATHSPECS: '1' },
+    timeoutMs: GIT_TIMEOUT_MS,
+    maxBytes: GIT_MAX_BYTES,
+    signal,
+  })
+  if (listed.exitCode !== 0) return changes
+  const embedded = new Set<string>()
+  for (const record of listed.stdout.split('\0')) {
+    // "<mode> <object> <stage>\t<path>"; mode 160000 is an embedded repository.
+    const tab = record.indexOf('\t')
+    if (tab >= 0 && record.slice(0, tab).startsWith('160000 ')) embedded.add(record.slice(tab + 1))
+  }
+  if (embedded.size === 0) return changes
+  return changes.map((change) => (embedded.has(change.path) ? { path: change.path, added: 0, deleted: 0, binary: true } : change))
 }
 
 /**

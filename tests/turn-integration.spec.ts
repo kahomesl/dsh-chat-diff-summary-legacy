@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../src/index.ts'
 import { MAX_FILES, SUMMARY_PATH, isChangeSummary, summaryUrl, type ChangeSummary } from '../src/summary.ts'
-import { cleanup, commitAll, fileDigest, git, makeRepo, treeDigest, write } from './support/repo.ts'
+import { cleanup, commitAll, fileDigest, git, makeDir, makeRepo, treeDigest, write } from './support/repo.ts'
 import { HostHarness, session, turnEnd, turnStart } from './support/host.ts'
 
 /** Scratch directories currently present under the system temporary root. */
@@ -68,6 +68,34 @@ async function shell(repo: string, script: string): Promise<void> {
   const { execFile } = await import('node:child_process')
   const { promisify } = await import('node:util')
   await promisify(execFile)('/bin/sh', ['-c', script], { cwd: repo })
+}
+
+/**
+ * Drive turns until one of them is measured.
+ *
+ * A synthetic workspace's first pass is background work, so the bar appears on
+ * the first turn that *begins* after the pass lands — which one that is depends
+ * on how long the pass takes, not on anything the spec controls. Polling under a
+ * bound is the same shape the scratch-cleanup assertion below uses: condition,
+ * not a fixed sleep.
+ * @param harness - the plugin's host harness.
+ * @param plain - the tracked directory.
+ * @returns the first measured summary, or the last empty one at the deadline.
+ */
+async function measureOnceWarm(harness: HostHarness, plain: string): Promise<ChangeSummary | undefined> {
+  let summary: ChangeSummary | undefined
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const turn = attempt + 2
+    harness.emitSessionEvent(session('s', { cwd: plain }), turnStart(turn))
+    await harness.runGate('s', `s${String(turn)}`)
+    await write(plain, 'kept.txt', `one\ntwo\nthree\n${'x\n'.repeat(turn)}\n`)
+    harness.emitSessionEvent(session('s', { cwd: plain }), turnEnd(turn))
+    await harness.runGate('s', `settle${String(turn)}`)
+    summary = (await (await readSummary(harness, 's', turn)).json()) as ChangeSummary
+    if (summary.total > 0) return summary
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  return summary
 }
 
 describe('a real turn in a real repository', () => {
@@ -179,23 +207,35 @@ describe('a real turn in a real repository', () => {
     }
   })
 
-  test('hides a workspace that is not a repository', async () => {
-    const plain = await makeRepo('dsh-notrepo')
-    const { rm } = await import('node:fs/promises')
-    await rm(join(plain, '.git'), { recursive: true, force: true })
+  test('tracks a directory that no repository encloses, from the turn after its first pass', async () => {
+    const plain = await makeDir('dsh-notrepo')
+    await write(plain, 'kept.txt', 'one\ntwo\n')
     const harness = new HostHarness()
     apply(harness.ctx)
     try {
+      // The first turn only starts the whole-directory pass, and it is never made
+      // to wait for it: the turn reports nothing rather than a number it cannot
+      // stand behind.
       harness.emitSessionEvent(session('s', { cwd: plain }), turnStart(1))
       await harness.runGate('s', 's')
-      await write(plain, 'anything.txt', 'hello\n')
+      await write(plain, 'during.txt', 'written while the pass ran\n')
       harness.emitSessionEvent(session('s', { cwd: plain }), turnEnd(1))
       await harness.runGate('s', 'settle')
-      // The turn is recorded as having nothing verifiable, so the route answers
-      // with a summary that draws as nothing — never a scan of the whole tree.
-      const response = await readSummary(harness, 's')
-      expect(response.status).toBe(200)
-      expect(await response.json()).toEqual({ turn: 1, files: [], total: 0, added: 0, deleted: 0 })
+      expect(((await (await readSummary(harness, 's')).json()) as ChangeSummary).total).toBe(0)
+
+      // The pass is background work, so the spec drives turns until the first one
+      // that could be measured lands — the way a real Session would, a turn later.
+      const summary = await measureOnceWarm(harness, plain)
+      // Which turn lands first depends on how long the pass takes, so the exact
+      // line count is not this spec's business: that the bar describes the turn's
+      // own edit, and only that edit, is.
+      expect(summary?.total).toBe(1)
+      expect(summary?.files.map((file) => [file.path, file.deleted])).toEqual([['kept.txt', 0]])
+      expect(summary?.added).toBeGreaterThan(0)
+
+      // The measured directory is left exactly as it was found: no `.git`, no
+      // index, and only the files the turns wrote.
+      expect((await readdir(plain)).sort()).toEqual(['during.txt', 'kept.txt'])
       expect(harness.warnings).toEqual([])
     } finally {
       harness.dispose()
