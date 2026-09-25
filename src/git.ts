@@ -11,7 +11,7 @@
  * probe that `snapshotTree` documents.
  */
 import { spawn } from 'node:child_process'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -94,6 +94,114 @@ export interface RawChange {
 /** Minimal subset of the host logger this module uses. */
 export interface GitLogger {
   warn(message: string): void
+  /** Optional: step costs and lifecycle notes; absent means "failures only". */
+  info?(message: string): void
+}
+
+/** Per-call identity the engine carries into every diagnostic it reports. */
+export interface GitCallContext {
+  /** Session whose turn drove this call, when one did. */
+  readonly sessionId?: string
+  /** Which attempt of a synthetic workspace's first pass this call belongs to. */
+  readonly attempt?: number
+}
+
+/** One step that failed, with everything needed to place it. */
+export interface GitFailure extends GitCallContext {
+  /** The step that failed, in git's own terms: `git init`, `add --all`, `write-tree`, … */
+  readonly operation: string
+  /** How long the step ran before it failed. */
+  readonly elapsedMs: number
+  /** Working directory or repository root the step addressed. */
+  readonly root?: string
+  /** Process exit code, or null when the process never started. */
+  readonly exitCode?: number | null
+  /** git's own words, truncated; never a path the plugin added. */
+  readonly stderr?: string
+  /** What the caller concluded, when the failure has no exit code. */
+  readonly detail?: string
+}
+
+/** One step that finished, reported for the steps whose cost is the story. */
+export interface GitStep extends GitCallContext {
+  readonly operation: string
+  readonly elapsedMs: number
+  readonly root?: string
+  readonly detail?: string
+}
+
+/** Where the engine reports what it did. */
+export interface GitDiagnostics {
+  failed(event: GitFailure): void
+  step(event: GitStep): void
+}
+
+/** A diagnostics sink that reports nothing; the default for direct calls. */
+export const SILENT_DIAGNOSTICS: GitDiagnostics = { failed: (): void => {}, step: (): void => {} }
+
+/** Longest stderr fragment any diagnostic carries. */
+const STDERR_LIMIT = 400
+
+/** Trim one diagnostic fragment to a single bounded line. */
+export function trimDiagnostic(text: string, limit = STDERR_LIMIT): string {
+  const collapsed = text.replace(/\s+/gu, ' ').trim()
+  return collapsed.length <= limit ? collapsed : `${collapsed.slice(0, limit)}…`
+}
+
+/** Render one failure as the line the host log carries. */
+export function describeFailure(event: GitFailure): string {
+  const parts = [`${event.operation} failed`]
+  if (event.sessionId !== undefined) parts.push(`session=${event.sessionId}`)
+  if (event.root !== undefined) parts.push(`root=${event.root}`)
+  if (event.attempt !== undefined) parts.push(`attempt=${String(event.attempt)}`)
+  if (event.exitCode !== undefined) parts.push(`exit=${String(event.exitCode)}`)
+  parts.push(`elapsed=${String(event.elapsedMs)}ms`)
+  if (event.detail !== undefined) parts.push(`detail=${event.detail}`)
+  if (event.stderr !== undefined && event.stderr !== '') parts.push(`stderr=${trimDiagnostic(event.stderr)}`)
+  return `chat-diff-summary-legacy: ${parts.join(' ')}`
+}
+
+/** Render one finished step as the line the host log carries. */
+export function describeStep(event: GitStep): string {
+  const parts = [`${event.operation} finished`]
+  if (event.sessionId !== undefined) parts.push(`session=${event.sessionId}`)
+  if (event.root !== undefined) parts.push(`root=${event.root}`)
+  if (event.attempt !== undefined) parts.push(`attempt=${String(event.attempt)}`)
+  parts.push(`elapsed=${String(event.elapsedMs)}ms`)
+  if (event.detail !== undefined) parts.push(`detail=${event.detail}`)
+  return `chat-diff-summary-legacy: ${parts.join(' ')}`
+}
+
+/** Report one failed git step, with the exit code and the words git used. */
+function reportFailure(diagnostics: GitDiagnostics, context: GitCallContext, operation: string, root: string | undefined, startedAt: number, result: CommandResult | undefined, detail?: string): void {
+  diagnostics.failed({
+    operation,
+    elapsedMs: Date.now() - startedAt,
+    ...root === undefined ? {} : { root },
+    ...context,
+    ...result === undefined ? {} : { exitCode: result.exitCode, stderr: result.stderr },
+    ...detail === undefined ? {} : { detail },
+  })
+}
+
+/** Report one finished git step together with what it cost. */
+function reportStep(diagnostics: GitDiagnostics, context: GitCallContext, operation: string, root: string | undefined, startedAt: number, detail?: string): void {
+  diagnostics.step({
+    operation,
+    elapsedMs: Date.now() - startedAt,
+    ...root === undefined ? {} : { root },
+    ...context,
+    ...detail === undefined ? {} : { detail },
+  })
+}
+
+/** Report an operation that threw instead of returning an exit code. */
+function reportThrown(diagnostics: GitDiagnostics, context: GitCallContext, operation: string, root: string | undefined, startedAt: number, error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error)
+  const timedOut = /timed out/iu.test(detail)
+  const aborted = /aborted/iu.test(detail)
+  reportFailure(diagnostics, context, operation, root, startedAt, undefined, aborted ? 'aborted (workspace disposed)' : timedOut ? `warmup timeout: ${detail}` : detail)
+  return detail
 }
 
 /** Run one program with a hard timeout, a stdout cap, and abort support. */
@@ -204,13 +312,25 @@ function toPosix(path: string): string {
  * @param cwd - absolute Session working directory.
  * @param scratch - yields the private directory; called only once a repository is found.
  * @param signal - cancellation.
+ * @param diagnostics - where step costs and failures are reported.
+ * @param context - the Session (and attempt) this call belongs to.
  * @returns the located repository, or null when `cwd` is outside one.
  */
-export async function locateWorkspace(runner: CommandRunner, executable: string, env: Readonly<Record<string, string>>, cwd: string, scratch: () => Promise<string>, signal: AbortSignal): Promise<GitWorkspace | null> {
+export async function locateWorkspace(runner: CommandRunner, executable: string, env: Readonly<Record<string, string>>, cwd: string, scratch: () => Promise<string>, signal: AbortSignal, diagnostics: GitDiagnostics = SILENT_DIAGNOSTICS, context: GitCallContext = {}): Promise<GitWorkspace | null> {
+  const started = Date.now()
   const found = await runner({ file: executable, args: ['rev-parse', '--show-toplevel', '--absolute-git-dir', '--git-path', 'objects'], cwd, env, timeoutMs: 10_000, maxBytes: 64 * 1024, signal })
-  if (found.exitCode !== 0) return null
+  if (found.exitCode !== 0) {
+    // Asking whether a directory is inside a repository is the one probe whose
+    // failure is the normal answer, so it is reported as a step, not a failure:
+    // the synthetic path is what runs next.
+    reportStep(diagnostics, context, 'rev-parse --show-toplevel (repository probe)', cwd, started, `exit=${String(found.exitCode)}`)
+    return null
+  }
   const [root, gitDir, repositoryObjects] = found.stdout.split('\n').slice(0, 3).map((line) => resolve(cwd, line))
-  if (root === undefined || gitDir === undefined || repositoryObjects === undefined) return null
+  if (root === undefined || gitDir === undefined || repositoryObjects === undefined) {
+    reportFailure(diagnostics, context, 'rev-parse --show-toplevel (repository probe)', cwd, started, found, 'the answer did not name a root, a git directory and an object store')
+    return null
+  }
   const objects = join(await scratch(), 'objects')
   await mkdir(objects, { recursive: true })
   // git reports the canonical top level, so the scratch is compared in the same spelling.
@@ -246,9 +366,11 @@ export async function locateWorkspace(runner: CommandRunner, executable: string,
  * @param index - absolute path this snapshot's private index is written to.
  * @param excludes - work-tree paths the snapshot must skip.
  * @param signal - cancellation.
+ * @param diagnostics - where step costs and failures are reported.
+ * @param context - the Session (and attempt) this call belongs to.
  * @returns the tree object id, or null when git refused the snapshot.
  */
-export async function snapshotTree(runner: CommandRunner, executable: string, workspace: GitWorkspace, index: string, excludes: readonly string[], signal: AbortSignal): Promise<string | null> {
+export async function snapshotTree(runner: CommandRunner, executable: string, workspace: GitWorkspace, index: string, excludes: readonly string[], signal: AbortSignal, diagnostics: GitDiagnostics = SILENT_DIAGNOSTICS, context: GitCallContext = {}): Promise<string | null> {
   await mkdir(join(index, '..'), { recursive: true })
   // Start from no index at all, so nothing can carry a stat cache into the add.
   await rm(index, { force: true })
@@ -256,15 +378,31 @@ export async function snapshotTree(runner: CommandRunner, executable: string, wo
   // Seed the tracked set from HEAD. A repository whose HEAD has no commit yet
   // (fresh `git init`) simply starts empty; either way no stat data survives.
   const seeded = await runner({ file: executable, args: ['read-tree', 'HEAD'], cwd: workspace.root, env, timeoutMs: GIT_TIMEOUT_MS, maxBytes: GIT_MAX_BYTES, signal })
-  if (seeded.exitCode !== 0) await rm(index, { force: true })
+  if (seeded.exitCode !== 0) {
+    // A repository with no commit yet answers this with a failure; the add below
+    // starts from an empty index instead, so this is reported and not fatal.
+    reportStep(diagnostics, context, 'read-tree HEAD (no commit yet)', workspace.root, Date.now(), `exit=${String(seeded.exitCode)}`)
+    await rm(index, { force: true })
+  }
   const pathspec = excludes.length === 0 ? [] : ['--', '.', ...excludes.map((path) => `:(exclude)${path}`)]
   // `--ignore-errors` skips unreadable files and reports them through exit 1; the index is still complete.
+  const addStarted = Date.now()
   const added = await runner({ file: executable, args: ['add', '--all', '--ignore-errors', ...pathspec], cwd: workspace.root, env, timeoutMs: GIT_TIMEOUT_MS, maxBytes: GIT_MAX_BYTES, signal })
-  if (added.exitCode !== 0 && added.exitCode !== 1) return null
+  if (added.exitCode !== 0 && added.exitCode !== 1) {
+    reportFailure(diagnostics, context, 'add --all', workspace.root, addStarted, added)
+    return null
+  }
   const written = await runner({ file: executable, args: ['write-tree'], cwd: workspace.root, env, timeoutMs: GIT_TIMEOUT_MS, maxBytes: 64 * 1024, signal })
-  if (written.exitCode !== 0) return null
+  if (written.exitCode !== 0) {
+    reportFailure(diagnostics, context, 'write-tree', workspace.root, addStarted, written)
+    return null
+  }
   const tree = written.stdout.trim()
-  return /^[0-9a-f]{40,64}$/u.test(tree) ? tree : null
+  if (!/^[0-9a-f]{40,64}$/u.test(tree)) {
+    reportFailure(diagnostics, context, 'write-tree', workspace.root, addStarted, written, 'the answer was not a tree id')
+    return null
+  }
+  return tree
 }
 
 /**
@@ -331,14 +469,18 @@ export const SYNTHETIC_EXCLUDES = [
  * @param cwd - absolute Session working directory, outside any repository.
  * @param scratch - this Session's private directory; the repository is created inside it.
  * @param signal - cancellation.
+ * @param diagnostics - where step costs and failures are reported.
+ * @param context - the Session (and attempt) this call belongs to.
  * @returns the synthetic workspace, or null when git refused to create one.
  */
-export async function locateSyntheticWorkspace(runner: CommandRunner, executable: string, env: Readonly<Record<string, string>>, cwd: string, scratch: string, signal: AbortSignal): Promise<GitWorkspace | null> {
+export async function locateSyntheticWorkspace(runner: CommandRunner, executable: string, env: Readonly<Record<string, string>>, cwd: string, scratch: string, signal: AbortSignal, diagnostics: GitDiagnostics = SILENT_DIAGNOSTICS, context: GitCallContext = {}): Promise<GitWorkspace | null> {
+  const started = Date.now()
   let root: string
   try {
     root = await realpath(cwd)
-  } catch {
+  } catch (error) {
     // A working directory that no longer exists cannot be measured.
+    reportThrown(diagnostics, context, 'realpath (working directory)', cwd, started, error)
     return null
   }
   const repository = join(scratch, 'directory')
@@ -349,10 +491,17 @@ export async function locateSyntheticWorkspace(runner: CommandRunner, executable
   // store this plugin owns. Git's own words are read in the C locale so the test
   // does not depend on the user's language.
   const outside = await runner({ file: executable, args: ['rev-parse', '--show-toplevel'], cwd: root, env: { ...env, LC_ALL: 'C' }, timeoutMs: 10_000, maxBytes: 64 * 1024, signal })
-  if (outside.exitCode === 0 || !/not a git repository/u.test(outside.stderr)) return null
+  if (outside.exitCode === 0 || !/not a git repository/u.test(outside.stderr)) {
+    reportFailure(diagnostics, context, 'rev-parse --show-toplevel (synthetic probe)', root, started, outside, outside.exitCode === 0 ? 'the directory turned out to be inside a repository' : 'git answered something other than "not a git repository"')
+    return null
+  }
   await mkdir(repository, { recursive: true })
+  const initStarted = Date.now()
   const created = await runner({ file: executable, args: ['init', '--quiet', repository], cwd: root, env, timeoutMs: 10_000, maxBytes: 64 * 1024, signal })
-  if (created.exitCode !== 0) return null
+  if (created.exitCode !== 0) {
+    reportFailure(diagnostics, context, 'git init (private repository)', root, initStarted, created)
+    return null
+  }
   // `git init <dir>` puts the repository in `<dir>/.git`; addressing that is what
   // makes every later call see a repository at all.
   const gitDir = join(repository, '.git')
@@ -362,9 +511,14 @@ export async function locateSyntheticWorkspace(runner: CommandRunner, executable
   // to discover a repository from `GIT_DIR` alone when the working directory is
   // not one, and a refusal here would abandon the whole workspace.
   for (const [key, value] of [['core.autocrlf', 'false'], ['core.safecrlf', 'false'], ['advice.addEmbeddedRepo', 'false']] as const) {
+    const configStarted = Date.now()
     const configured = await runner({ file: executable, args: ['config', '--file', join(gitDir, 'config'), key, value], cwd: root, env, timeoutMs: 10_000, maxBytes: 64 * 1024, signal })
-    if (configured.exitCode !== 0) return null
+    if (configured.exitCode !== 0) {
+      reportFailure(diagnostics, context, `git config ${key}`, root, configStarted, configured)
+      return null
+    }
   }
+  reportStep(diagnostics, context, 'private repository created', root, started, `gitDir=${gitDir}`)
   return {
     root,
     gitDir,
@@ -394,17 +548,46 @@ export async function locateSyntheticWorkspace(runner: CommandRunner, executable
  * @param workspace - the synthetic workspace.
  * @param timeoutMs - bound for the add; the first pass needs more of it than a turn does.
  * @param signal - cancellation.
+ * @param diagnostics - where step costs and failures are reported.
+ * @param context - the Session (and attempt) this call belongs to.
  * @returns the tree object id, or null when git refused the snapshot.
  */
-export async function snapshotSyntheticTree(runner: CommandRunner, executable: string, workspace: GitWorkspace, timeoutMs: number, signal: AbortSignal): Promise<string | null> {
+export async function snapshotSyntheticTree(runner: CommandRunner, executable: string, workspace: GitWorkspace, timeoutMs: number, signal: AbortSignal, diagnostics: GitDiagnostics = SILENT_DIAGNOSTICS, context: GitCallContext = {}): Promise<string | null> {
   const pathspec = workspace.excludes.length === 0 ? [] : ['--', '.', ...workspace.excludes.map((path) => `:(exclude)${path}`)]
-  // `--ignore-errors` skips unreadable files and reports them through exit 1; the index is still complete.
-  const added = await runner({ file: executable, args: ['add', '--all', '--ignore-errors', ...pathspec], cwd: workspace.root, env: workspace.env, timeoutMs, maxBytes: GIT_MAX_BYTES, signal })
-  if (added.exitCode !== 0 && added.exitCode !== 1) return null
-  const written = await runner({ file: executable, args: ['write-tree'], cwd: workspace.root, env: workspace.env, timeoutMs: GIT_TIMEOUT_MS, maxBytes: 64 * 1024, signal })
-  if (written.exitCode !== 0) return null
+  const first = Date.now()
+  let added: CommandResult
+  try {
+    // `--ignore-errors` skips unreadable files and reports them through exit 1; the index is still complete.
+    added = await runner({ file: executable, args: ['add', '--all', '--ignore-errors', ...pathspec], cwd: workspace.root, env: workspace.env, timeoutMs, maxBytes: GIT_MAX_BYTES, signal })
+  } catch (error) {
+    // A timeout or an abort throws rather than answering, and it is the failure
+    // this plugin's first pass is most likely to hit on a large directory.
+    reportThrown(diagnostics, context, timeoutMs > GIT_TIMEOUT_MS ? 'add --all (first pass)' : 'add --all (incremental)', workspace.root, first, error)
+    return null
+  }
+  if (added.exitCode !== 0 && added.exitCode !== 1) {
+    reportFailure(diagnostics, context, timeoutMs > GIT_TIMEOUT_MS ? 'add --all (first pass)' : 'add --all (incremental)', workspace.root, first, added, 'git refused the add')
+    return null
+  }
+  const writeStarted = Date.now()
+  let written: CommandResult
+  try {
+    written = await runner({ file: executable, args: ['write-tree'], cwd: workspace.root, env: workspace.env, timeoutMs: GIT_TIMEOUT_MS, maxBytes: 64 * 1024, signal })
+  } catch (error) {
+    reportThrown(diagnostics, context, 'write-tree', workspace.root, writeStarted, error)
+    return null
+  }
+  if (written.exitCode !== 0) {
+    reportFailure(diagnostics, context, 'write-tree', workspace.root, writeStarted, written)
+    return null
+  }
   const tree = written.stdout.trim()
-  return /^[0-9a-f]{40,64}$/u.test(tree) ? tree : null
+  if (!/^[0-9a-f]{40,64}$/u.test(tree)) {
+    reportFailure(diagnostics, context, 'write-tree', workspace.root, writeStarted, written, 'the answer was not a tree id')
+    return null
+  }
+  reportStep(diagnostics, context, timeoutMs > GIT_TIMEOUT_MS ? 'add --all (first pass)' : 'add --all (incremental)', workspace.root, first, `tree=${tree.slice(0, 12)}`)
+  return tree
 }
 
 /**
@@ -424,11 +607,13 @@ export async function snapshotSyntheticTree(runner: CommandRunner, executable: s
  * @param before - turn-start tree id.
  * @param after - turn-end tree id.
  * @param signal - cancellation.
+ * @param diagnostics - where step costs and failures are reported.
+ * @param context - the Session (and attempt) this call belongs to.
  * @returns changed files relative to the Session working directory.
  * @throws when git fails or the output exceeded the cap.
  */
-export async function diffSyntheticTrees(runner: CommandRunner, executable: string, workspace: GitWorkspace, before: string, after: string, signal: AbortSignal): Promise<RawChange[]> {
-  const changes = await diffTrees(runner, executable, workspace, before, after, signal)
+export async function diffSyntheticTrees(runner: CommandRunner, executable: string, workspace: GitWorkspace, before: string, after: string, signal: AbortSignal, diagnostics: GitDiagnostics = SILENT_DIAGNOSTICS, context: GitCallContext = {}): Promise<RawChange[]> {
+  const changes = await diffTrees(runner, executable, workspace, before, after, signal, diagnostics, context)
   if (changes.length === 0) return changes
   const listed = await runner({
     file: executable,
@@ -440,7 +625,10 @@ export async function diffSyntheticTrees(runner: CommandRunner, executable: stri
     maxBytes: GIT_MAX_BYTES,
     signal,
   })
-  if (listed.exitCode !== 0) return changes
+  if (listed.exitCode !== 0) {
+    reportFailure(diagnostics, context, 'ls-files (embedded repositories)', workspace.root, Date.now(), listed)
+    return changes
+  }
   const embedded = new Set<string>()
   for (const record of listed.stdout.split('\0')) {
     // "<mode> <object> <stage>\t<path>"; mode 160000 is an embedded repository.
@@ -498,22 +686,148 @@ export function parseNumstat(output: string): RawChange[] {
  * @param before - turn-start tree id.
  * @param after - turn-end tree id.
  * @param signal - cancellation.
+ * @param diagnostics - where step costs and failures are reported.
+ * @param context - the Session (and attempt) this call belongs to.
  * @returns changed files relative to the repository root.
  * @throws when git fails or the output exceeded the cap.
  */
-export async function diffTrees(runner: CommandRunner, executable: string, workspace: GitWorkspace, before: string, after: string, signal: AbortSignal): Promise<RawChange[]> {
+export async function diffTrees(runner: CommandRunner, executable: string, workspace: GitWorkspace, before: string, after: string, signal: AbortSignal, diagnostics: GitDiagnostics = SILENT_DIAGNOSTICS, context: GitCallContext = {}): Promise<RawChange[]> {
   if (before === after) return []
+  const started = Date.now()
   const result = await runner({ file: executable, args: ['diff-tree', '-r', '-M', '-z', '--numstat', before, after], cwd: workspace.root, env: workspace.env, timeoutMs: GIT_TIMEOUT_MS, maxBytes: GIT_MAX_BYTES, signal })
-  if (result.exitCode !== 0) throw new Error(`git diff-tree failed: ${result.stderr.trim()}`)
+  if (result.exitCode !== 0) {
+    reportFailure(diagnostics, context, 'diff-tree', workspace.root, started, result)
+    throw new Error(`git diff-tree failed: ${result.stderr.trim()}`)
+  }
   return parseNumstat(result.stdout)
 }
 
-/** Create one private scratch directory outside the work tree, canonicalized. */
-export async function createScratch(label: string): Promise<string> {
-  return realpath(await mkdtemp(join(tmpdir(), `${label}-`)))
+/** Marker file every scratch directory of this plugin starts with. */
+export const SCRATCH_MARKER_FILE = '.dsh-chat-diff-legacy-scratch.json'
+
+/**
+ * What a scratch directory says about itself.
+ *
+ * The marker is what makes cleanup safe: a directory is only ever removed when
+ * this file names this plugin. Name matching alone is not enough — another
+ * program's temporary directory may share the prefix, and deleting by prefix
+ * would be a data-loss bug, not a cleanup.
+ */
+export interface ScratchMarker {
+  /** Bumped when this shape changes; an unknown schema is never removed. */
+  readonly schema: 1
+  /** Owning plugin, matched exactly before anything is deleted. */
+  readonly plugin: string
+  /** What the directory holds. */
+  readonly kind: 'repository' | 'synthetic'
+  /** Working directory the snapshots measure. */
+  readonly root?: string
+  /** Host process that created it, for a reader's benefit only. */
+  readonly pid: number
+  readonly createdAt: string
+}
+
+/** Create one private scratch directory outside the work tree, canonicalized, and mark it. */
+export async function createScratch(label: string, marker: ScratchMarker): Promise<string> {
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), `${label}-`)))
+  await writeFile(join(scratch, SCRATCH_MARKER_FILE), `${JSON.stringify(marker, null, 2)}\n`, 'utf8')
+  return scratch
 }
 
 /** Remove one private scratch directory and everything git wrote into it. */
-export async function removeScratch(scratch: string): Promise<void> {
-  await rm(scratch, { recursive: true, force: true })
+export async function removeScratch(scratch: string, diagnostics: GitDiagnostics = SILENT_DIAGNOSTICS, context: GitCallContext = {}): Promise<void> {
+  const started = Date.now()
+  try {
+    await rm(scratch, { recursive: true, force: true })
+  } catch (error) {
+    // Windows refuses to delete a directory a git process still holds open; the
+    // caller must know, because a half-removed scratch is what the startup sweep
+    // exists to collect.
+    reportThrown(diagnostics, context, 'remove scratch directory', scratch, started, error)
+  }
+}
+
+/** What one startup sweep did. */
+export interface ScratchGcResult {
+  /** Directories this sweep removed. */
+  readonly removed: readonly string[]
+  /** Directories it recognised as this plugin's but left alone: too fresh, or in use. */
+  readonly kept: readonly string[]
+  /** Directories carrying the prefix but not this plugin's marker; never touched. */
+  readonly unrecognised: readonly string[]
+}
+
+/** How old a scratch directory must be before a sweep may remove it. */
+export const SCRATCH_ORPHAN_MIN_AGE_MS = 24 * 60 * 60_000
+
+/** Most candidates one startup sweep will inspect, so a huge temp root cannot stall boot. */
+const SCRATCH_GC_LIMIT = 200
+
+/**
+ * Remove scratch directories this plugin left behind when a host died.
+ *
+ * A plugin teardown removes every scratch it owns; only a crash, a kill or a
+ * failed removal can leave one. This sweep is the answer to those, and it is
+ * deliberately conservative: the directory name must carry the plugin's prefix,
+ * the marker file must exist and name this plugin with a known schema, and the
+ * directory must not have been written to for {@link SCRATCH_ORPHAN_MIN_AGE_MS}.
+ * A live host writes into its scratch on every turn, so an in-use directory is
+ * never old enough to qualify, and a foreign directory is never touched at all.
+ *
+ * @param options - the prefix, the owner name, and the bounds.
+ * @returns what the sweep removed, kept and refused to recognise.
+ */
+export async function collectOrphanScratches(options: { label: string; plugin: string; minAgeMs?: number; now?: number; root?: string; diagnostics?: GitDiagnostics }): Promise<ScratchGcResult> {
+  const prefix = `${options.label}-`
+  const minAgeMs = options.minAgeMs ?? SCRATCH_ORPHAN_MIN_AGE_MS
+  const now = options.now ?? Date.now()
+  const root = options.root ?? tmpdir()
+  const diagnostics = options.diagnostics ?? SILENT_DIAGNOSTICS
+  const removed: string[] = []
+  const kept: string[] = []
+  const unrecognised: string[] = []
+  let candidates: string[]
+  try {
+    candidates = (await readdir(root, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
+      .map((entry) => join(root, entry.name))
+      .slice(0, SCRATCH_GC_LIMIT)
+  } catch (error) {
+    reportThrown(diagnostics, {}, 'read the temporary root', root, Date.now(), error)
+    return { removed, kept, unrecognised }
+  }
+  for (const candidate of candidates) {
+    let marker: ScratchMarker
+    try {
+      marker = JSON.parse(await readFile(join(candidate, SCRATCH_MARKER_FILE), 'utf8')) as ScratchMarker
+    } catch {
+      // No marker, or one this plugin cannot read: not ours to delete.
+      unrecognised.push(candidate)
+      continue
+    }
+    if (marker.plugin !== options.plugin || marker.schema !== 1) {
+      unrecognised.push(candidate)
+      continue
+    }
+    let age: number
+    try {
+      age = now - (await stat(candidate)).mtimeMs
+    } catch {
+      unrecognised.push(candidate)
+      continue
+    }
+    if (age < minAgeMs) {
+      kept.push(candidate)
+      continue
+    }
+    const started = Date.now()
+    try {
+      await rm(candidate, { recursive: true, force: true })
+      removed.push(candidate)
+      reportStep(diagnostics, {}, 'removed an orphaned scratch directory', candidate, started, `kind=${marker.kind} ageMs=${String(Math.round(age))}`)
+    } catch (error) {
+      reportThrown(diagnostics, {}, 'remove an orphaned scratch directory', candidate, started, error)
+    }
+  }
+  return { removed, kept, unrecognised }
 }

@@ -3,18 +3,19 @@
  * summary route.
  *
  * This plugin owns a small legacy tracker instead of borrowing the official
- * workspace-change service, because DeepSeek Harness 0.1.5-rc.2 — the line
- * shipped inside DSH Desktop 2.0.13 — has no such service: no
+ * workspace-change service, because DeepSeek Harness 0.1.7-rc.2 — the line
+ * shipped inside this DSH Desktop build — still has no such service: no
  * `@deepseek-ai/dsh-workspace-changes` package, no `ctx.workspaceChanges`, no
  * `workspace/changes` Session event. The tracker is driven by the two real turn
  * boundaries of that line, `turn/start` and `turn/end`, observed through the
- * public `session/event` feed.
+ * public `session/event` feed, and it gates tool dispatch through
+ * `tools/pre-execute` exactly as the official service does.
  *
  * The browser half never runs git and never sees a path: it fetches one
  * summary for one Session over the route registered here.
  */
 import type { HostContext, SessionEventLike, SessionLike, ToolExecutionLike } from './host.ts'
-import { runCommand } from './git.ts'
+import { collectOrphanScratches, describeFailure, describeStep, runCommand } from './git.ts'
 import { createEngineProvider, TurnTracker } from './tracker.ts'
 import { PLUGIN_NAME, SUMMARY_PATH, type ChangeSummary } from './summary.ts'
 
@@ -78,6 +79,26 @@ export function apply(ctx: HostContext): void {
   const lifetime = new AbortController()
   const engine = createEngineProvider(runCommand, ctx.logger, lifetime.signal)
   const tracker = new TurnTracker(engine, ctx.logger, lifetime.signal)
+
+  // A host that was killed rather than disposed leaves its scratch directories
+  // behind. The sweep only ever removes a directory that carries this plugin's
+  // own marker and has not been written to for a day, so it cannot touch a live
+  // workspace or another program's temporary directory. It is deliberately not
+  // awaited: boot does not wait on a cleanup.
+  void collectOrphanScratches({
+    label: 'dsh-chat-diff-legacy',
+    plugin: PLUGIN_NAME,
+    diagnostics: {
+      failed: (event) => ctx.logger.warn(describeFailure(event)),
+      step: (event) => ctx.logger.info(describeStep(event)),
+    },
+  }).then((result) => {
+    if (result.removed.length > 0 || result.unrecognised.length > 0) {
+      ctx.logger.info(`chat-diff-summary-legacy: startup sweep removed ${String(result.removed.length)} orphaned scratch director${result.removed.length === 1 ? 'y' : 'ies'}, left ${String(result.unrecognised.length)} unrecognised and ${String(result.kept.length)} in use`)
+    }
+  }, (error: unknown) => {
+    ctx.logger.warn(`chat-diff-summary-legacy: startup sweep failed: ${error instanceof Error ? error.message : String(error)}`)
+  })
 
   ctx.effect(() => async () => {
     lifetime.abort()

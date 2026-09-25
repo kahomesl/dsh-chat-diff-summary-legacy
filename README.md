@@ -156,13 +156,15 @@ node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/ds
 - 两个 Session 同时在同一仓库工作时，各自测量自己的回合边界，但共享同一份工作树 —— 并发改动可能同时出现在两个 Session 的统计里。
 - 行数遵循仓库自己的 git 配置，包括 `.gitattributes` 过滤器和 `core.autocrlf`。
 - 文件清单最多 200 条；计数保持完整，清单会说明省略了多少条。
-- 宿主进程被 `SIGKILL` 时没有任何 disposer 会跑，会在系统临时目录留下每个 Session 一个 `dsh-chat-diff-legacy-*` 小目录（只含该仓库的快照对象和一份私有索引），随时删掉都是安全的。
+- 宿主进程被 `SIGKILL` 时没有任何 disposer 会跑，会在系统临时目录留下 `dsh-chat-diff-legacy-*` 目录。每个这样的目录里都有一份 `.dsh-chat-diff-legacy-scratch.json` 标记（写着所属插件、类型、工作目录）；插件下次启动会清扫**带该标记、且 24 小时内没被写过**的目录，不认标记的一律不动。要手工清也可以，标记文件就是判据。
 
 ## 非 Git 工作区
 
-会话的工作目录不在任何仓库里时，插件在**临时目录里自建一个私有仓库**来测量这份目录：`git init` 只发生在该 Session 自己的 scratch 目录里，工作目录不会被写入 `.git`、索引或对象库（`tests/git.spec.ts` 里有断言）。测量仍然完全交给 git —— `add --all`、`write-tree`、`diff-tree --numstat` —— 插件自己不遍历、不哈希任何文件。
+会话的工作目录不在任何仓库里时，插件在**临时目录里自建一个私有仓库**来测量这份目录：`git init` 只发生在 scratch 目录里，工作目录不会被写入 `.git`、索引或对象库（`tests/git.spec.ts` 里有断言）。测量仍然完全交给 git —— `add --all`、`write-tree`、`diff-tree --numstat` —— 插件自己不遍历、不哈希任何文件。
 
-- **第一遍只预热，不出数字**。首次遇到该目录时要读一遍被接受的全部文件：实测 1.7 GB / 28k 文件 + 默认忽略集 = **36.7 s**，对象库约 **810 MB**（都在临时目录里）。这一遍在后台跑，**不会**卡住工具调用；它落地的那个回合不报数字，从下一个回合起正常测量，此后每轮只是一次 stat 扫描（同一目录实测 **0.13 s**）。
+- **一个目录一份工作区，所有 Session 共用**。工作区按 `realpath(cwd)` 归一化后做键（Windows 下大小写不敏感），因此同一目录开多个 Session **只做一次全量第一遍**，第二、第三个 Session 只付一次 stat 扫描的代价；某个 Session 结束时也不会把别人正在用的对象库删掉（引用计数 + 5 分钟空闲窗口，插件卸载时立即回收）。
+- **第一遍不再让回合丢数字**。首次遇到该目录时要读一遍被接受的全部文件：实测 1.7 GB / 28k 文件 + 默认忽略集 = **36.7 s**，对象库约 **810 MB**（都在临时目录里）。这一遍现在**排在回合的链上**：`turn/start` 之后的第一个工具调用会等它（宿主门闸等的就是这条链），基线随之建立，**该回合并不会因为预热而报空**——准确优先于不卡顿。等待有上限（`WARMUP_GATE_BUDGET_MS`，默认 120 s）：超过上限的那一轮会在日志里明说"这一轮没有基线、可能什么都不报"，而预热继续在后台跑，下一轮直接受益。此后每轮只是一次 stat 扫描（同一目录实测 **0.13 s**）。
+- **第一遍失败会重试，不是永久失效**。失败状态、尝试次数、失败原因都记在共享工作区上；下一轮按指数退避重试（1 s 起，上限 5 分钟），期间不会重复读整个目录。日志里能区分是 `realpath`、`rev-parse`、`git init`、`git config`、`add --all`（首次/增量）、`write-tree`、`diff-tree` 还是超时/中止失败，并带上 session、目录、退出码、git 输出与耗时。
 - **默认忽略集**写在私有仓库的 `info/exclude`，目录里已有的 `.gitignore` 照常生效：
 
   ```text
@@ -183,11 +185,11 @@ node -p "require(process.env.HOME + '/.dsh/profiles/node_modules/@deepseek-ai/ds
 npm install
 npm run typecheck
 npm run build      # lib/index.js（宿主）+ lib/client.js（浏览器）
-npm run test       # 156 个测试
+npm run test       # 198 个测试
 npm run verify     # 上面三步依次跑
 ```
 
-测试 156 个，覆盖：统计路由与文案、真实 git 仓库上的 snapshots / numstat 解析 / 重命名 / 二进制 / 等长编辑回归探针、回合跟踪与节流、跨回合集成、浏览器侧取值与订阅、槽位注册与渲染。
+测试 198 个，覆盖：统计路由与文案、真实 git 仓库上的 snapshots / numstat 解析 / 重命名 / 二进制 / 等长编辑回归探针、回合跟踪与节流、共享合成工作区（单次预热 / 并发接入 / 失败重试与退避 / 引用计数与回收）、临时目录清扫的安全判据、跨回合集成、浏览器侧取值与订阅、槽位注册与渲染。
 
 浏览器半边通过 `window.__ModuleLoader__` 加载，因此 `react` 和 `react/jsx-runtime` 必须声明为 external —— `tsdown` 的 `external` 选项和 `peerDependencies` 两处都要写，因为 tsdown 0.15 没有 `deps.neverBundle` 这个键，而无法识别的选项是**静默失效**的，会打进第二份 React（`tests/bundle.spec.ts` 断言产物里只有两个 `require`）。
 

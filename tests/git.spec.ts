@@ -9,10 +9,11 @@
  * refs, and the object store are all hashed around every snapshot below.
  */
 import { describe, expect, test } from 'vitest'
-import { readFile, mkdir, readdir, realpath, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readFile, mkdir, readdir, realpath, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { isAbsolute, join } from 'node:path'
 import {
   GIT_TIMEOUT_MS,
+  collectOrphanScratches,
   createScratch,
   diffSyntheticTrees,
   diffTrees,
@@ -26,7 +27,8 @@ import {
   snapshotSyntheticTree,
   snapshotTree,
 } from '../src/git.ts'
-import { cleanup, commitAll, fileDigest, git, makeDir, makeRepo, treeDigest, write } from './support/repo.ts'
+import type { CommandRunner, GitDiagnostics, GitFailure, GitWorkspace } from '../src/git.ts'
+import { cleanup, commitAll, fileDigest, git, makeDir, makeRepo, makeScratch, treeDigest, write } from './support/repo.ts'
 
 /**
  * Repository *metadata* the snapshots must not disturb. The work tree itself is
@@ -93,7 +95,7 @@ describe('resolving git', () => {
 describe('locating a workspace', () => {
   test('refuses a directory outside any repository', async () => {
     const plain = await makeDir('dsh-plain')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     try {
       await expect(locateWorkspace(runCommand, executable, environment, plain, () => Promise.resolve(scratch), new AbortController().signal)).resolves.toBeNull()
     } finally {
@@ -103,13 +105,15 @@ describe('locating a workspace', () => {
 
   test('resolves the repository root from a nested working directory', async () => {
     const repo = await makeRepo('dsh-nested')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     try {
       await write(repo, 'a/b/c.txt', 'x\n')
       await commitAll(repo, 'init')
       const nested = join(repo, 'a', 'b')
       const located = await locateWorkspace(runCommand, executable, environment, nested, () => Promise.resolve(scratch), new AbortController().signal)
-      expect(located?.root).toBe(await git(repo, ['rev-parse', '--show-toplevel']))
+      // git reports the top level with forward slashes on every platform, so the
+      // two spellings are compared as one path rather than as two strings.
+      expect(located?.root.replace(/\\/gu, '/')).toBe((await git(repo, ['rev-parse', '--show-toplevel'])).replace(/\\/gu, '/'))
     } finally {
       await cleanup(repo, scratch)
     }
@@ -119,7 +123,7 @@ describe('locating a workspace', () => {
 describe('snapshotting a working tree', () => {
   test('does not count what was already dirty when the turn began', async () => {
     const repo = await makeRepo('dsh-baseline')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     try {
       await write(repo, 'A.txt', 'a\nb\nc\n')
       await write(repo, 'B.txt', 'x\n')
@@ -145,12 +149,13 @@ describe('snapshotting a working tree', () => {
       // ---- the turn: a shell edit, a new file, a deletion, a binary, a rename ----
       await write(repo, 'A.txt', 'a\nB2\nc\nd\n')
       await write(repo, 'D.txt', 'new\nfile\n')
-      await runCommand({ file: '/bin/rm', args: [join(repo, 'E.txt')], cwd: repo, env: environment, timeoutMs: 10_000, maxBytes: 4_096, signal })
+      // A deletion and a rename made the way a script or `sed -i` makes them:
+      // straight through the filesystem, with the real index left alone. Node's
+      // own calls are used rather than a shell, so the spec makes the same edit
+      // on every platform.
+      await rm(join(repo, 'E.txt'), { force: true })
+      await rename(join(repo, 'G.txt'), join(repo, 'H.txt'))
       await write(repo, 'Bin.dat', 'zzz\u0000\u0001\u0002')
-      // A plain filesystem rename, the way a script or `sed -i` would do it: the
-      // real index is left alone, which is exactly the case rename detection
-      // has to handle.
-      await runCommand({ file: '/bin/mv', args: [join(repo, 'G.txt'), join(repo, 'H.txt')], cwd: repo, env: environment, timeoutMs: 10_000, maxBytes: 4_096, signal })
       // And an ignored file, which must never be counted.
       await write(repo, 'ignored.txt', 'not tracked\n')
 
@@ -184,7 +189,7 @@ describe('snapshotting a working tree', () => {
 
   test('snapshots a repository whose HEAD has no commit yet', async () => {
     const repo = await makeRepo('dsh-unborn')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     try {
       await write(repo, 'f.txt', 'hello\n')
       const workspace = await locateWorkspace(runCommand, executable, environment, repo, () => Promise.resolve(scratch), new AbortController().signal)
@@ -211,7 +216,7 @@ describe('snapshotting a working tree', () => {
     // this machine; seeding from HEAD fails none of them, and the loop makes the
     // assertion a real (if probabilistic) guard rather than a single coin flip.
     const repo = await makeRepo('dsh-samelen')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     const signal = new AbortController().signal
     await write(repo, 'a.txt', 'one\n')
     await commitAll(repo, 'init')
@@ -240,7 +245,7 @@ describe('snapshotting a working tree', () => {
 
   test('treats an identical pair of snapshots as no changes at all', async () => {
     const repo = await makeRepo('dsh-clean')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     try {
       await write(repo, 'a.txt', 'one\n')
       await commitAll(repo, 'init')
@@ -255,7 +260,7 @@ describe('snapshotting a working tree', () => {
 
   test('keeps the repository whole across a second turn, too', async () => {
     const repo = await makeRepo('dsh-repeat')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     const signal = new AbortController().signal
     try {
       await write(repo, 'a.txt', 'one\n')
@@ -280,15 +285,16 @@ describe('snapshotting a working tree', () => {
 
 describe('the private scratch directory', () => {
   test('is created outside the work tree and removed on request', async () => {
-    const scratch = await createScratch('dsh-probe')
-    expect(scratch.startsWith('/')).toBe(true)
+    const scratch = await makeScratch()
+    // Outside the work tree is what matters; the spelling is the platform's.
+    expect(isAbsolute(scratch)).toBe(true)
     await removeScratch(scratch)
     await expect(stat(scratch)).rejects.toThrow()
   })
 
   test('never lets a repository index be written through GIT_INDEX_FILE', async () => {
     const repo = await makeRepo('dsh-index')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     try {
       await write(repo, 'a.txt', 'one\n')
       await commitAll(repo, 'init')
@@ -310,7 +316,7 @@ describe('the private scratch directory', () => {
 describe('a directory no repository encloses', () => {
   test('gets a private repository the directory itself never sees', async () => {
     const plain = await makeDir('dsh-synthetic')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     try {
       await write(plain, 'a.txt', 'one\n')
       const workspace = await locateSyntheticWorkspace(runCommand, executable, environment, plain, scratch, new AbortController().signal)
@@ -326,7 +332,7 @@ describe('a directory no repository encloses', () => {
 
   test('measures one turn from the tree it opened with', async () => {
     const plain = await makeDir('dsh-synthetic-turn')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     const signal = new AbortController().signal
     try {
       await write(plain, 'a.txt', 'one\ntwo\n')
@@ -348,7 +354,7 @@ describe('a directory no repository encloses', () => {
 
   test('applies the default excludes, so a dependency tree is never read', async () => {
     const plain = await makeDir('dsh-synthetic-excludes')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     const signal = new AbortController().signal
     try {
       await write(plain, 'kept.txt', 'one\n')
@@ -369,7 +375,7 @@ describe('a directory no repository encloses', () => {
 
   test('reports an embedded repository without inventing a line count', async () => {
     const plain = await makeDir('dsh-synthetic-nested')
-    const scratch = await createScratch('dsh-probe')
+    const scratch = await makeScratch()
     const signal = new AbortController().signal
     try {
       await write(plain, 'kept.txt', 'one\n')
@@ -395,6 +401,170 @@ describe('a directory no repository encloses', () => {
       ])
     } finally {
       await cleanup(plain, scratch)
+    }
+  })
+})
+
+describe('what a failing git step reports', () => {
+  /** A workspace stub: these specs drive the runner, never git itself. */
+  const workspace: GitWorkspace = { root: '/plain', gitDir: '/scratch/directory/.git', scratch: '/scratch', env: {}, excludes: [], synthetic: true }
+
+  /** A diagnostics sink that records what it was told. */
+  function recorder(): { failures: GitFailure[]; steps: string[]; sink: GitDiagnostics } {
+    const failures: GitFailure[] = []
+    const steps: string[] = []
+    return {
+      failures,
+      steps,
+      sink: {
+        failed: (event) => failures.push(event),
+        step: (event) => steps.push(event.operation),
+      },
+    }
+  }
+
+  test('names the step, the exit code, git s words and the cost when an add fails', async () => {
+    const { failures, sink } = recorder()
+    const runner: CommandRunner = () => Promise.resolve({ exitCode: 128, stdout: '', stderr: 'fatal: unable to read tree' })
+    const tree = await snapshotSyntheticTree(runner, 'git', workspace, GIT_TIMEOUT_MS, new AbortController().signal, sink, { sessionId: 's1', attempt: 2 })
+    expect(tree).toBeNull()
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toMatchObject({
+      operation: 'add --all (incremental)',
+      sessionId: 's1',
+      attempt: 2,
+      root: '/plain',
+      exitCode: 128,
+      stderr: 'fatal: unable to read tree',
+    })
+    expect(failures[0]?.elapsedMs).toBeGreaterThanOrEqual(0)
+  })
+
+  test('names the first pass as such, so a slow directory is distinguishable from a slow turn', async () => {
+    const { failures, sink } = recorder()
+    const runner: CommandRunner = () => Promise.resolve({ exitCode: 128, stdout: '', stderr: 'fatal: index file smaller than expected' })
+    await snapshotSyntheticTree(runner, 'git', workspace, GIT_TIMEOUT_MS * 20, new AbortController().signal, sink, { sessionId: 's1', attempt: 1 })
+    expect(failures[0]?.operation).toBe('add --all (first pass)')
+  })
+
+  test('reports a timeout as a warmup timeout rather than a bare message', async () => {
+    const { failures, sink } = recorder()
+    const runner: CommandRunner = () => Promise.reject(new Error('timed out after 600000ms: git add --all'))
+    const tree = await snapshotSyntheticTree(runner, 'git', workspace, GIT_TIMEOUT_MS * 20, new AbortController().signal, sink, { sessionId: 's1', attempt: 1 })
+    expect(tree).toBeNull()
+    expect(failures[0]?.detail).toMatch(/warmup timeout/u)
+    expect(failures[0]?.detail).toMatch(/timed out after 600000ms/u)
+  })
+
+  test('reports an abort as the disposal it is, not as a git failure', async () => {
+    const { failures, sink } = recorder()
+    const runner: CommandRunner = () => Promise.reject(new Error('aborted: git add --all'))
+    await snapshotSyntheticTree(runner, 'git', workspace, GIT_TIMEOUT_MS, new AbortController().signal, sink)
+    expect(failures[0]?.detail).toBe('aborted (workspace disposed)')
+  })
+
+  test('refuses a snapshot whose write-tree answered with something that is not a tree id', async () => {
+    const { failures, sink } = recorder()
+    const runner: CommandRunner = (request) => Promise.resolve(request.args[0] === 'write-tree'
+      ? { exitCode: 0, stdout: 'not-a-tree\n', stderr: '' }
+      : { exitCode: 0, stdout: '', stderr: '' })
+    const tree = await snapshotSyntheticTree(runner, 'git', workspace, GIT_TIMEOUT_MS, new AbortController().signal, sink)
+    expect(tree).toBeNull()
+    expect(failures[0]).toMatchObject({ operation: 'write-tree', detail: 'the answer was not a tree id' })
+  })
+})
+
+describe('sweeping scratch directories a dead host left behind', () => {
+  /** One candidate directory carrying `marker`, with a chosen age. */
+  async function candidate(root: string, name: string, marker: unknown, ageMs: number): Promise<string> {
+    const dir = join(root, name)
+    await mkdir(dir, { recursive: true })
+    if (marker !== undefined) await writeFile(join(dir, '.dsh-chat-diff-legacy-scratch.json'), JSON.stringify(marker), 'utf8')
+    const when = new Date(Date.now() - ageMs)
+    await utimes(dir, when, when)
+    return dir
+  }
+
+  const mine = { schema: 1, plugin: 'chat-diff-summary-legacy', kind: 'synthetic', pid: 4321, createdAt: new Date().toISOString() }
+  const day = 24 * 60 * 60_000
+
+  test('removes an old directory that carries this plugin s marker', async () => {
+    const root = await makeDir('dsh-gc')
+    try {
+      const old = await candidate(root, 'dsh-probe-old', mine, day + 60_000)
+      const result = await collectOrphanScratches({ label: 'dsh-probe', plugin: 'chat-diff-summary-legacy', root })
+      expect(result.removed).toEqual([old])
+      await expect(stat(old)).rejects.toThrow()
+    } finally {
+      await cleanup(root)
+    }
+  })
+
+  test('leaves a directory that is too fresh to be an orphan', async () => {
+    const root = await makeDir('dsh-gc')
+    try {
+      const fresh = await candidate(root, 'dsh-probe-fresh', mine, 1_000)
+      const result = await collectOrphanScratches({ label: 'dsh-probe', plugin: 'chat-diff-summary-legacy', root })
+      expect(result.removed).toEqual([])
+      expect(result.kept).toEqual([fresh])
+      expect((await stat(fresh)).isDirectory()).toBe(true)
+    } finally {
+      await cleanup(root)
+    }
+  })
+
+  test('never removes a directory it cannot prove is its own', async () => {
+    const root = await makeDir('dsh-gc')
+    try {
+      const bare = await candidate(root, 'dsh-probe-bare', undefined, day * 2)
+      const foreign = await candidate(root, 'dsh-probe-foreign', { ...mine, plugin: 'somebody-else' }, day * 2)
+      const otherSchema = await candidate(root, 'dsh-probe-schema', { ...mine, schema: 99 }, day * 2)
+      const result = await collectOrphanScratches({ label: 'dsh-probe', plugin: 'chat-diff-summary-legacy', root })
+      expect(result.removed).toEqual([])
+      expect([...result.unrecognised].sort()).toEqual([bare, foreign, otherSchema].sort())
+      for (const dir of [bare, foreign, otherSchema]) expect((await stat(dir)).isDirectory()).toBe(true)
+    } finally {
+      await cleanup(root)
+    }
+  })
+
+  test('ignores a directory whose name does not carry the plugin s prefix', async () => {
+    const root = await makeDir('dsh-gc')
+    try {
+      const other = await candidate(root, 'some-other-program-7f2', mine, day * 2)
+      const result = await collectOrphanScratches({ label: 'dsh-probe', plugin: 'chat-diff-summary-legacy', root })
+      expect(result.removed).toEqual([])
+      expect(result.unrecognised).toEqual([])
+      expect((await stat(other)).isDirectory()).toBe(true)
+    } finally {
+      await cleanup(root)
+    }
+  })
+
+  test('says what it removed through diagnostics', async () => {
+    const root = await makeDir('dsh-gc')
+    const steps: string[] = []
+    try {
+      await candidate(root, 'dsh-probe-old', mine, day * 2)
+      await collectOrphanScratches({
+        label: 'dsh-probe',
+        plugin: 'chat-diff-summary-legacy',
+        root,
+        diagnostics: { failed: () => {}, step: (event) => steps.push(event.operation) },
+      })
+      expect(steps).toEqual(['removed an orphaned scratch directory'])
+    } finally {
+      await cleanup(root)
+    }
+  })
+
+  test('a directory this plugin just created is recognised as its own', async () => {
+    const scratch = await createScratch('dsh-probe', { schema: 1, plugin: 'chat-diff-summary-legacy', kind: 'repository', pid: process.pid, createdAt: new Date().toISOString() })
+    try {
+      const marker = JSON.parse(await readFile(join(scratch, '.dsh-chat-diff-legacy-scratch.json'), 'utf8')) as { plugin: string; schema: number }
+      expect(marker).toMatchObject({ plugin: 'chat-diff-summary-legacy', schema: 1 })
+    } finally {
+      await cleanup(scratch)
     }
   })
 })

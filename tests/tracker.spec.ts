@@ -8,7 +8,10 @@ import { describe, expect, test, vi } from 'vitest'
 import type { ChangeEngine } from '../src/tracker.ts'
 import { createEngineProvider, PROGRESS_INTERVAL_MS, summarize, TurnTracker } from '../src/tracker.ts'
 import type { CommandRunner, GitWorkspace, RawChange } from '../src/git.ts'
+import { WARMUP_BACKOFF_BASE_MS } from '../src/synthetic-workspace.ts'
+import { SyntheticWorkspaces } from '../src/synthetic-workspace.ts'
 import { MAX_RETAINED_TURNS } from '../src/summary.ts'
+import { cleanup, makeDir } from './support/repo.ts'
 
 /** What the fake engine returns for one call. */
 interface Script {
@@ -30,6 +33,8 @@ class FakeEngine implements ChangeEngine {
   private readonly synthetic: boolean
   private warmTree: string | null = 'warm-tree'
   private measured = 0
+  /** Whether a synthetic pass has ever succeeded, which is what makes turns measurable. */
+  private warmed = false
 
   constructor(script: Script = {}) {
     this.changes = script.diff ?? []
@@ -52,10 +57,12 @@ class FakeEngine implements ChangeEngine {
     this.warmTree = tree
   }
 
-  locate(cwd: string): Promise<GitWorkspace | null> {
+  locate(cwd: string, scratch: () => Promise<string>): Promise<GitWorkspace | null> {
     this.calls.push(`locate:${cwd}`)
     if (!this.located) return Promise.resolve(null)
-    return Promise.resolve({ root: '/repo', gitDir: '/repo/.git', scratch: '/scratch', env: {}, excludes: [] })
+    // The real engine creates the private directory only once a repository is
+    // found, so the fake asks for it at the same moment.
+    return scratch().then((directory) => ({ root: '/repo', gitDir: '/repo/.git', scratch: directory, env: {}, excludes: [] }))
   }
 
   locateDirectory(cwd: string): Promise<GitWorkspace | null> {
@@ -71,7 +78,14 @@ class FakeEngine implements ChangeEngine {
 
   snapshotDirectory(_workspace: GitWorkspace, warm: boolean): Promise<string | null> {
     this.calls.push(warm ? 'warm' : 'snapshotDirectory')
-    if (warm) return Promise.resolve(this.warmTree)
+    if (warm) {
+      if (this.warmTree !== null) this.warmed = true
+      return Promise.resolve(this.warmTree)
+    }
+    // A synthetic workspace that has never been read whole cannot measure a turn:
+    // there is no tree to compare against, which is why a failed first pass makes
+    // its turn honestly empty rather than inventing numbers.
+    if (!this.warmed) return Promise.resolve(null)
     // A fresh tree per measurement, so a baseline and its end differ.
     this.measured += 1
     return Promise.resolve(`directory-tree-${String(this.measured)}`)
@@ -95,17 +109,12 @@ class FakeEngine implements ChangeEngine {
   }
 }
 
-/** Let an off-chain promise's callbacks run, the way a real first pass would. */
-async function flush(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0))
-}
-
 /** A tracker over a fake engine and a live lifetime signal. */
-function trackerWith(engine: ChangeEngine): { tracker: TurnTracker; warnings: string[]; lifetime: AbortController } {
+function trackerWith(engine: ChangeEngine, registry?: SyntheticWorkspaces): { tracker: TurnTracker; warnings: string[]; lifetime: AbortController } {
   const warnings: string[] = []
   const lifetime = new AbortController()
   const provider = (): Promise<ChangeEngine | null> => Promise.resolve(engine)
-  return { tracker: new TurnTracker(provider, { warn: (message) => warnings.push(message) }, lifetime.signal), warnings, lifetime }
+  return { tracker: new TurnTracker(provider, { warn: (message) => warnings.push(message) }, lifetime.signal, registry), warnings, lifetime }
 }
 
 const CHANGES: readonly RawChange[] = [
@@ -248,55 +257,130 @@ describe('a turn', () => {
   })
 
   test('keeps nothing when git cannot address the directory at all', async () => {
-    const engine = new FakeEngine({ locate: false, synthetic: false })
-    const { tracker } = trackerWith(engine)
-    tracker.beginTurn('s1', '/plain', undefined, 0, 1)
-    tracker.endTurn('s1', 1)
-    await tracker.settle('s1')
-    expect(tracker.summary('s1')).toEqual({ turn: 1, files: [], total: 0, added: 0, deleted: 0 })
-    expect(tracker.summary('s1')?.total).toBe(0)
-    expect(engine.calls).toEqual(['locate:/plain', 'locateDirectory:/plain'])
+    const plain = await makeDir('dsh-tracker-nogit')
+    try {
+      const engine = new FakeEngine({ locate: false, synthetic: false })
+      const { tracker } = trackerWith(engine)
+      tracker.beginTurn('s1', plain, undefined, 0, 1)
+      tracker.endTurn('s1', 1)
+      await tracker.settle('s1')
+      expect(tracker.summary('s1')).toEqual({ turn: 1, files: [], total: 0, added: 0, deleted: 0 })
+      expect(tracker.summary('s1')?.total).toBe(0)
+      expect(engine.calls.map((call) => call.split(':')[0])).toEqual(['locate', 'locateDirectory'])
+    } finally {
+      await cleanup(plain)
+    }
   })
 
-  test('mints a private repository for a directory no repository encloses, one turn later', async () => {
-    const engine = new FakeEngine({ locate: false, synthetic: true, diff: CHANGES })
-    const { tracker } = trackerWith(engine)
-    tracker.beginTurn('s1', '/plain', undefined, 0, 1)
-    tracker.endTurn('s1', 1)
-    await tracker.settle('s1')
-    await flush()
-    // The first turn only starts the whole-directory pass, and the pass itself
-    // stays off the chain the tool gate awaits: no turn ever waits on it.
-    expect(engine.calls).toEqual(['locate:/plain', 'locateDirectory:/plain', 'warm'])
-    expect(tracker.summary('s1')).toEqual({ turn: 1, files: [], total: 0, added: 0, deleted: 0 })
-
-    tracker.beginTurn('s1', '/plain', undefined, 0, 2)
-    tracker.endTurn('s1', 2)
-    await tracker.settle('s1')
-    // The turn that begins after the pass lands is measured like any other.
-    expect(tracker.summary('s1', 2)?.total).toBe(CHANGES.length)
-    expect(tracker.summary('s1', 2)?.files.map((file) => file.path)).toEqual(['a.ts', 'src/b.ts'])
-    expect(engine.calls).toContain('snapshotDirectory')
+  test('measures a cold synthetic directory from its very first turn', async () => {
+    const plain = await makeDir('dsh-tracker-cold')
+    try {
+      const engine = new FakeEngine({ locate: false, synthetic: true, diff: CHANGES })
+      const { tracker } = trackerWith(engine)
+      tracker.beginTurn('s1', plain, undefined, 0, 1)
+      // The whole-directory pass is queued on the Session's chain, which is what
+      // the tool gate awaits: the pass lands, and the baseline is taken after it,
+      // before anything can mutate the tree.
+      await tracker.settle('s1')
+      expect(engine.calls.map((call) => call.split(':')[0])).toEqual(['locate', 'locateDirectory', 'warm', 'snapshotDirectory'])
+      tracker.endTurn('s1', 1)
+      await tracker.settle('s1')
+      // The turn therefore reports its own changes: waiting beats losing them.
+      expect(tracker.summary('s1')?.total).toBe(CHANGES.length)
+      expect(tracker.summary('s1', 1)?.files.map((file) => file.path)).toEqual(['a.ts', 'src/b.ts'])
+    } finally {
+      await cleanup(plain)
+    }
   })
 
-  test('reports a failed first pass once and never reads the directory again', async () => {
-    const engine = new FakeEngine({ locate: false, synthetic: true, diff: CHANGES })
-    engine.setWarmTree(null)
-    const { tracker, warnings } = trackerWith(engine)
-    tracker.beginTurn('s1', '/plain', undefined, 0, 1)
-    tracker.endTurn('s1', 1)
-    await tracker.settle('s1')
-    await flush()
-    expect(warnings).toHaveLength(1)
-    expect(warnings[0]).toMatch(/could not read the working directory/u)
+  test('runs one whole-directory pass for two Sessions in the same directory', async () => {
+    const plain = await makeDir('dsh-tracker-shared')
+    try {
+      const engine = new FakeEngine({ locate: false, synthetic: true, diff: CHANGES })
+      const { tracker } = trackerWith(engine)
+      for (const id of ['a', 'b']) {
+        tracker.beginTurn(id, plain, undefined, 0, 1)
+        tracker.endTurn(id, 1)
+        await tracker.settle(id)
+      }
+      expect(engine.calls.filter((call) => call === 'warm')).toHaveLength(1)
+      // One scratch directory serves both Sessions, and the repository path never
+      // minted a second one for a directory that has no repository.
+      expect(engine.scratches).toHaveLength(1)
+      expect(tracker.summary('a')?.total).toBe(CHANGES.length)
+      expect(tracker.summary('b')?.total).toBe(CHANGES.length)
+    } finally {
+      await cleanup(plain)
+    }
+  })
 
-    tracker.beginTurn('s1', '/plain', undefined, 0, 2)
-    tracker.endTurn('s1', 2)
-    await tracker.settle('s1')
-    await flush()
-    // No repeated whole-directory pass, and no numbers invented for the turn.
-    expect(engine.calls.filter((call) => call === 'warm')).toHaveLength(1)
-    expect(tracker.summary('s1', 2)?.total).toBe(0)
+  test('retries a failed synthetic warmup on a later turn', async () => {
+    const plain = await makeDir('dsh-tracker-retry')
+    try {
+      const engine = new FakeEngine({ locate: false, synthetic: true, diff: CHANGES })
+      engine.setWarmTree(null)
+      const warnings: string[] = []
+      const lifetime = new AbortController()
+      const clock = { now: 1_000_000 }
+      const registry = new SyntheticWorkspaces({ warn: (message) => warnings.push(message) }, lifetime.signal, { now: () => clock.now, idleMs: 0 })
+      const tracker = new TurnTracker(() => Promise.resolve(engine), { warn: (message) => warnings.push(message) }, lifetime.signal, registry)
+
+      // Turn 1: the pass fails, so this turn is honestly empty — and says why.
+      tracker.beginTurn('s1', plain, undefined, 0, 1)
+      tracker.endTurn('s1', 1)
+      await tracker.settle('s1')
+      expect(tracker.summary('s1')?.total).toBe(0)
+      expect(engine.calls.filter((call) => call === 'warm')).toHaveLength(1)
+      expect(warnings.join('\n')).toMatch(/first pass/u)
+
+      // Inside the backoff the next turn does not try again.
+      tracker.beginTurn('s1', plain, undefined, 0, 2)
+      tracker.endTurn('s1', 2)
+      await tracker.settle('s1')
+      expect(engine.calls.filter((call) => call === 'warm')).toHaveLength(1)
+
+      // Past it, the retry lands and the Session is measurable again: one failed
+      // pass does not cost the rest of the Session its statistics.
+      engine.setWarmTree('warm-tree')
+      clock.now += WARMUP_BACKOFF_BASE_MS + 1
+      tracker.beginTurn('s1', plain, undefined, 0, 3)
+      tracker.endTurn('s1', 3)
+      await tracker.settle('s1')
+      expect(engine.calls.filter((call) => call === 'warm')).toHaveLength(2)
+      expect(tracker.summary('s1', 3)?.total).toBe(CHANGES.length)
+      await tracker.dispose()
+    } finally {
+      await cleanup(plain)
+    }
+  })
+
+  test('keeps a shared synthetic workspace alive while another Session still uses it', async () => {
+    const plain = await makeDir('dsh-tracker-life')
+    try {
+      const engine = new FakeEngine({ locate: false, synthetic: true, diff: CHANGES })
+      const { tracker } = trackerWith(engine)
+      tracker.beginTurn('a', plain, undefined, 0, 1)
+      tracker.endTurn('a', 1)
+      await tracker.settle('a')
+      tracker.beginTurn('b', plain, undefined, 0, 1)
+      tracker.endTurn('b', 1)
+      await tracker.settle('b')
+      expect(engine.scratches).toHaveLength(1)
+
+      await tracker.disposeSession('a')
+      // b's workspace is not deleted out from under it.
+      expect(engine.removed).toEqual([])
+      tracker.beginTurn('b', plain, undefined, 0, 2)
+      tracker.endTurn('b', 2)
+      await tracker.settle('b')
+      expect(tracker.summary('b', 2)?.total).toBe(CHANGES.length)
+
+      // The last one out takes the workspace with it.
+      await tracker.dispose()
+      expect(engine.removed).toEqual(['/scratch-0'])
+    } finally {
+      await cleanup(plain)
+    }
   })
 
   test('does not re-serve an older turn as this turn when git refuses the snapshot', async () => {

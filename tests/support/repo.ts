@@ -11,6 +11,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { join, relative, sep } from 'node:path'
 import { promisify } from 'node:util'
+import { createScratch } from '../../src/git.ts'
 
 const run = promisify(execFile)
 
@@ -87,4 +88,15 @@ export async function treeDigest(root: string): Promise<string> {
 /** Remove a directory created by {@link makeDir} or {@link makeRepo}. */
 export async function cleanup(...dirs: readonly string[]): Promise<void> {
   await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })))
+}
+
+/** Create a private scratch directory the way the plugin's engine does, marker and all. */
+export async function makeScratch(label = 'dsh-probe', kind: 'repository' | 'synthetic' = 'repository'): Promise<string> {
+  return createScratch(label, {
+    schema: 1,
+    plugin: 'chat-diff-summary-legacy',
+    kind,
+    pid: process.pid,
+    createdAt: new Date().toISOString(),
+  })
 }

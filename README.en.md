@@ -218,28 +218,47 @@ tested — it is not a runtime version check.
   `.gitattributes` filters and `core.autocrlf`.
 - The file list is capped at 200 entries; the count stays complete and the list
   says how many were omitted.
-- The scratch directory is removed when a Session is disposed and when the plugin
-  is disposed — but *not* when the host process is killed outright, where no
-  disposer runs. A `SIGKILL`ed host therefore leaves one small directory per
-  Session it was tracking under the system temporary root, named
-  `dsh-chat-diff-legacy-*`. They hold only that repository's snapshot objects and
-  a private index, and removing them is always safe.
+- The scratch directory is removed when the shared workspace it belongs to is
+  retired, and everything is removed when the plugin is disposed — but *not* when
+  the host process is killed outright, where no disposer runs. A `SIGKILL`ed host
+  therefore leaves `dsh-chat-diff-legacy-*` directories under the system temporary
+  root, and each one carries a `.dsh-chat-diff-legacy-scratch.json` marker naming
+  the plugin, the kind of workspace and the measured directory. The next plugin
+  start sweeps marked directories that have not been written to for 24 hours; a
+  directory without a marker this plugin can read is never touched.
 
 ## Non-Git workspaces
 
 When a Session's working directory is not inside any repository, the plugin mints
-a **private repository inside the Session's own scratch directory** and measures
-the directory with it: `git init` happens there alone, so the measured directory
-gains no `.git`, no index and no object store (`tests/git.spec.ts` asserts it).
-The measurement is still entirely git's — `add --all`, `write-tree`,
+a **private repository inside a scratch directory** and measures the directory
+with it: `git init` happens there alone, so the measured directory gains no
+`.git`, no index and no object store (`tests/git.spec.ts` asserts it). The
+measurement is still entirely git's — `add --all`, `write-tree`,
 `diff-tree --numstat`; no file is walked or hashed by this plugin.
 
-- **The first pass only warms up; it reports no numbers.** Reading every accepted
+- **One workspace per directory, shared by every Session in it.** The workspace is
+  keyed by `realpath(cwd)`, case-folded on Windows, so a second Session in the same
+  directory reuses the first one's repository and object store instead of paying
+  another whole-directory pass. A Session ending does not delete a workspace
+  another Session is still measuring through: the last consumer out starts a
+  five-minute idle window, and plugin disposal retires everything at once.
+- **The first pass no longer costs a turn its numbers.** Reading every accepted
   file once measured **36.7 s** and about **810 MB** of temporary object store on
-  a 1.7 GB / 28k-file directory with the default excludes. That pass runs in the
-  background — it never holds a tool call — the turn it lands in reports nothing,
-  and the next turn is measured normally. From then on a turn costs a stat walk:
-  **0.13 s** on the same directory.
+  a 1.7 GB / 28k-file directory with the default excludes. That pass now runs on
+  the Session's chain — the host's tool gate awaits it — so the turn's baseline is
+  written before its first mutating tool and the turn is measured like any other.
+  Accuracy is worth the wait. The wait is bounded (`WARMUP_GATE_BUDGET_MS`,
+  120 s by default): a pass that outlives it keeps running in the background, and
+  the turn it outlived says in the log that it has no baseline rather than going
+  quietly empty. From then on a turn costs a stat walk: **0.13 s** on the same
+  directory.
+- **A failed first pass is retried, not remembered.** The failure, the attempt
+  count and git's own words stay on the shared workspace, and a later turn retries
+  behind an exponential backoff (1 s, doubling to a 5-minute ceiling). Diagnostics
+  name the step that failed — `realpath`, `rev-parse`, `git init`, `git config`,
+  `add --all` (first pass or incremental), `write-tree`, `diff-tree`, a timeout or
+  a disposal abort — with the Session, the directory, the exit code, git's
+  truncated stderr and the elapsed time.
 - **Default ignore rules** live in the private repository's `info/exclude`; a
   `.gitignore` inside the directory still applies:
 

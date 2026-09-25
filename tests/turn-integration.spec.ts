@@ -67,35 +67,20 @@ async function makeBaselinedRepo(prefix: string): Promise<string> {
 async function shell(repo: string, script: string): Promise<void> {
   const { execFile } = await import('node:child_process')
   const { promisify } = await import('node:util')
-  await promisify(execFile)('/bin/sh', ['-c', script], { cwd: repo })
-}
-
-/**
- * Drive turns until one of them is measured.
- *
- * A synthetic workspace's first pass is background work, so the bar appears on
- * the first turn that *begins* after the pass lands — which one that is depends
- * on how long the pass takes, not on anything the spec controls. Polling under a
- * bound is the same shape the scratch-cleanup assertion below uses: condition,
- * not a fixed sleep.
- * @param harness - the plugin's host harness.
- * @param plain - the tracked directory.
- * @returns the first measured summary, or the last empty one at the deadline.
- */
-async function measureOnceWarm(harness: HostHarness, plain: string): Promise<ChangeSummary | undefined> {
-  let summary: ChangeSummary | undefined
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const turn = attempt + 2
-    harness.emitSessionEvent(session('s', { cwd: plain }), turnStart(turn))
-    await harness.runGate('s', `s${String(turn)}`)
-    await write(plain, 'kept.txt', `one\ntwo\nthree\n${'x\n'.repeat(turn)}\n`)
-    harness.emitSessionEvent(session('s', { cwd: plain }), turnEnd(turn))
-    await harness.runGate('s', `settle${String(turn)}`)
-    summary = (await (await readSummary(harness, 's', turn)).json()) as ChangeSummary
-    if (summary.total > 0) return summary
-    await new Promise((resolve) => setTimeout(resolve, 50))
+  // The script is written for a POSIX shell. Windows has no `/bin/sh`, so the
+  // shell that ships with Git for Windows runs the same script unchanged; that
+  // keeps the spec's edit identical on every host.
+  const candidates = process.platform === 'win32' ? ['C:\\Program Files\\Git\\bin\\bash.exe', 'bash'] : ['/bin/sh']
+  let lastError: unknown
+  for (const shellPath of candidates) {
+    try {
+      await promisify(execFile)(shellPath, ['-c', script], { cwd: repo })
+      return
+    } catch (error) {
+      lastError = error
+    }
   }
-  return summary
+  throw lastError
 }
 
 describe('a real turn in a real repository', () => {
@@ -207,31 +192,25 @@ describe('a real turn in a real repository', () => {
     }
   })
 
-  test('tracks a directory that no repository encloses, from the turn after its first pass', async () => {
+  test('tracks a directory that no repository encloses, from its very first turn', async () => {
     const plain = await makeDir('dsh-notrepo')
     await write(plain, 'kept.txt', 'one\ntwo\n')
     const harness = new HostHarness()
     apply(harness.ctx)
+    const bound = session('s', { cwd: plain })
     try {
-      // The first turn only starts the whole-directory pass, and it is never made
-      // to wait for it: the turn reports nothing rather than a number it cannot
-      // stand behind.
-      harness.emitSessionEvent(session('s', { cwd: plain }), turnStart(1))
+      harness.emitSessionEvent(bound, turnStart(1))
+      // The tool gate is what waits for the whole-directory pass: by the time it
+      // releases, the baseline exists, so this turn's own edit is measured
+      // rather than lost. Accuracy is the reason the wait exists.
       await harness.runGate('s', 's')
-      await write(plain, 'during.txt', 'written while the pass ran\n')
-      harness.emitSessionEvent(session('s', { cwd: plain }), turnEnd(1))
+      await write(plain, 'during.txt', 'written after the baseline\n')
+      harness.emitSessionEvent(bound, turnEnd(1))
       await harness.runGate('s', 'settle')
-      expect(((await (await readSummary(harness, 's')).json()) as ChangeSummary).total).toBe(0)
-
-      // The pass is background work, so the spec drives turns until the first one
-      // that could be measured lands — the way a real Session would, a turn later.
-      const summary = await measureOnceWarm(harness, plain)
-      // Which turn lands first depends on how long the pass takes, so the exact
-      // line count is not this spec's business: that the bar describes the turn's
-      // own edit, and only that edit, is.
-      expect(summary?.total).toBe(1)
-      expect(summary?.files.map((file) => [file.path, file.deleted])).toEqual([['kept.txt', 0]])
-      expect(summary?.added).toBeGreaterThan(0)
+      const summary = (await (await readSummary(harness, 's', 1)).json()) as ChangeSummary
+      expect(summary.total).toBe(1)
+      expect(summary.files.map((file) => file.path)).toEqual(['during.txt'])
+      expect(summary.added).toBeGreaterThan(0)
 
       // The measured directory is left exactly as it was found: no `.git`, no
       // index, and only the files the turns wrote.
@@ -239,6 +218,116 @@ describe('a real turn in a real repository', () => {
       expect(harness.warnings).toEqual([])
     } finally {
       harness.dispose()
+      await cleanup(plain)
+    }
+  })
+
+  test('shares one private repository between two Sessions in the same directory', async () => {
+    const plain = await makeDir('dsh-shared-dir')
+    await write(plain, 'kept.txt', 'one\n')
+    const baseline = await scratchDirs()
+    const harness = new HostHarness()
+    apply(harness.ctx)
+    try {
+      for (const id of ['a', 'b']) {
+        harness.emitSessionEvent(session(id, { cwd: plain }), turnStart(1))
+        await harness.runGate(id, `${id}-open`)
+        await write(plain, `${id}.txt`, 'x\n')
+        harness.emitSessionEvent(session(id, { cwd: plain }), turnEnd(1))
+        await harness.runGate(id, `${id}-close`)
+      }
+      // One directory, one workspace: the second Session cost a stat walk, not a
+      // second whole-directory pass and a second object store.
+      const created = (await scratchDirs()).filter((name) => !baseline.includes(name))
+      expect(created).toHaveLength(1)
+      const first = (await (await readSummary(harness, 'a', 1)).json()) as ChangeSummary
+      const second = (await (await readSummary(harness, 'b', 1)).json()) as ChangeSummary
+      // Each Session still reports only its own turn's work.
+      expect(first.files.map((file) => file.path)).toEqual(['a.txt'])
+      expect(second.files.map((file) => file.path)).toEqual(['b.txt'])
+      expect(harness.warnings).toEqual([])
+    } finally {
+      harness.dispose()
+      await cleanup(plain)
+    }
+  })
+
+  test('measures later turns of a warmed directory without another pass', async () => {
+    const plain = await makeDir('dsh-warm-fast')
+    await write(plain, 'kept.txt', 'one\n')
+    const baseline = await scratchDirs()
+    const harness = new HostHarness()
+    apply(harness.ctx)
+    const bound = session('s', { cwd: plain })
+    try {
+      harness.emitSessionEvent(bound, turnStart(1))
+      await harness.runGate('s', 's1')
+      harness.emitSessionEvent(bound, turnEnd(1))
+      await harness.runGate('s', 'e1')
+
+      harness.emitSessionEvent(bound, turnStart(2))
+      await harness.runGate('s', 's2')
+      await write(plain, 'second.txt', 'y\n')
+      harness.emitSessionEvent(bound, turnEnd(2))
+      await harness.runGate('s', 'e2')
+
+      const summary = (await (await readSummary(harness, 's', 2)).json()) as ChangeSummary
+      expect(summary.files.map((file) => file.path)).toEqual(['second.txt'])
+      // The warmed directory is measured in place: no second workspace exists.
+      expect((await scratchDirs()).filter((name) => !baseline.includes(name))).toHaveLength(1)
+      expect(harness.warnings).toEqual([])
+    } finally {
+      harness.dispose()
+      await cleanup(plain)
+    }
+  })
+
+  test('keeps one Session working after the other one is disposed', async () => {
+    const plain = await makeDir('dsh-shared-life')
+    await write(plain, 'kept.txt', 'one\n')
+    const baseline = await scratchDirs()
+    const harness = new HostHarness()
+    apply(harness.ctx)
+    try {
+      for (const id of ['a', 'b']) {
+        harness.emitSessionEvent(session(id, { cwd: plain }), turnStart(1))
+        await harness.runGate(id, `${id}-open`)
+        harness.emitSessionEvent(session(id, { cwd: plain }), turnEnd(1))
+        await harness.runGate(id, `${id}-close`)
+      }
+      harness.emitSessionDisposed(session('a', { cwd: plain }))
+      // The surviving Session keeps its workspace: the first one's teardown does
+      // not delete a repository another Session is still measuring through.
+      harness.emitSessionEvent(session('b', { cwd: plain }), turnStart(2))
+      await harness.runGate('b', 'b-open')
+      await write(plain, 'b-later.txt', 'z\n')
+      harness.emitSessionEvent(session('b', { cwd: plain }), turnEnd(2))
+      await harness.runGate('b', 'b-close')
+      const summary = (await (await readSummary(harness, 'b', 2)).json()) as ChangeSummary
+      expect(summary.files.map((file) => file.path)).toEqual(['b-later.txt'])
+      expect((await scratchDirs()).filter((name) => !baseline.includes(name))).toHaveLength(1)
+    } finally {
+      harness.dispose()
+      await cleanup(plain)
+    }
+  })
+
+  test('removes a shared workspace when the plugin is disposed', async () => {
+    const plain = await makeDir('dsh-shared-dispose')
+    await write(plain, 'kept.txt', 'one\n')
+    const baseline = await scratchDirs()
+    const harness = new HostHarness()
+    apply(harness.ctx)
+    try {
+      harness.emitSessionEvent(session('s', { cwd: plain }), turnStart(1))
+      await harness.runGate('s', 's')
+      harness.emitSessionEvent(session('s', { cwd: plain }), turnEnd(1))
+      await harness.runGate('s', 'settle')
+      expect((await scratchDirs()).filter((name) => !baseline.includes(name))).toHaveLength(1)
+    } finally {
+      harness.dispose()
+      // Plugin teardown is not subject to the idle window: it removes at once.
+      expect(await waitForScratchCleanup(baseline)).toEqual([])
       await cleanup(plain)
     }
   })

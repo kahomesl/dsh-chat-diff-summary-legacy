@@ -9,7 +9,7 @@
  */
 import { describe, expect, test } from 'vitest'
 import { readFile, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 
 /** Read one built artifact, or undefined when the project has not been built. */
 async function artifact(name: string): Promise<string | undefined> {
@@ -124,7 +124,8 @@ describe('the target line', () => {
 
   test('scans code rather than comments, without emptying the file it scans', async () => {
     const files = await sources()
-    const host = files.find((file) => file.path.endsWith('src/index.ts'))
+    // Paths are joined by the platform, so the lookup is spelled the same way.
+    const host = files.find((file) => file.path.split(sep).join('/').endsWith('src/index.ts'))
     expect(host).toBeDefined()
     // The strip must leave executable text behind, or every assertion above
     // would pass vacuously.

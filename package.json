@@ -1,6 +1,6 @@
 {
   "name": "dsh-chat-diff-summary-legacy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Legacy-compatible DSH plugin: a Codex-style per-turn git working-tree change summary bar above the composer, built for DeepSeek Harness 0.1.5-rc.1 through 0.1.7 (verified on 0.1.5-rc.2 and 0.1.7-rc.2)",
   "license": "MIT",
   "repository": {
